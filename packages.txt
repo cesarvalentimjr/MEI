@@ -1,0 +1,5 @@
+python3-dev
+gcc
+g++
+libpoppler-cpp-dev
+pkg-config
