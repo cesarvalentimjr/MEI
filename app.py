@@ -102,31 +102,67 @@ class EnhancedBankMatcher(BankPatternMatcher):
     
     def get_value_patterns(self) -> List[str]:
         return [
-            r'(?:R\$\s*)?([+-]?\s*\d{1,3}(?:\.\d{3})*(?:,\d{2}))',  # R$ 1.234,56 com sinal opcional
-            r'([+-]?\s*\d{1,3}(?:\.\d{3})*,\d{2})',                 # 1.234,56 com sinal opcional
-            r'([+-]?\s*\d+,\d{2})',                                  # 123,45 com sinal opcional
-            r'([+-]?\s*\d{1,3}(?:\.\d{3})*\.\d{2})',                # Formato americano 1,234.56
-            r'(\d+\s*[CD])',                                         # Valores com C (crédito) ou D (débito)
+            # Formatos com sinais explícitos
+            r'(?:R\$\s*)?([+-]\s*\d{1,3}(?:\.\d{3})*,\d{2})',       # R$ +1.234,56 ou R$ -1.234,56
+            r'([+-]\s*\d{1,3}(?:\.\d{3})*,\d{2})',                  # +1.234,56 ou -1.234,56
+            r'([+-]\s*\d+,\d{2})',                                   # +123,45 ou -123,45
+            
+            # Formatos com C/D (crédito/débito)
+            r'(\d{1,3}(?:\.\d{3})*,\d{2})\s*[CD]',                  # 1.234,56 C ou 1.234,56 D
+            r'(\d+,\d{2})\s*[CD]',                                   # 123,45 C ou 123,45 D
+            r'([CD]\s*\d{1,3}(?:\.\d{3})*,\d{2})',                  # C 1.234,56 ou D 1.234,56
+            r'([CD]\s*\d+,\d{2})',                                   # C 123,45 ou D 123,45
+            
+            # Formatos normais (sem sinal)
+            r'(?:R\$\s*)?(\d{1,3}(?:\.\d{3})*,\d{2})',              # R$ 1.234,56
+            r'(\d{1,3}(?:\.\d{3})*,\d{2})',                         # 1.234,56
+            r'(\d+,\d{2})',                                          # 123,45
+            
+            # Formato americano
+            r'([+-]?\s*\d{1,3}(?:,\d{3})*\.\d{2})',                 # 1,234.56 (formato americano)
         ]
     
     def get_noise_patterns(self) -> List[str]:
         return [
+            # Cabeçalhos e informações do banco
             r'^BANCO\s+.*$',
             r'^AGÊNCIA\s+.*$',
             r'^CONTA\s+.*$',
-            r'^SALDO\s+ANTERIOR\s*.*$',
-            r'^SALDO\s+ATUAL\s*.*$',
+            r'^CPF\s*:?\s*\d+.*$',
+            r'^CNPJ\s*:?\s*\d+.*$',
             r'^EXTRATO\s+.*$',
             r'^PERÍODO\s+.*$',
             r'^PÁGINA\s+\d+.*$',
-            r'^CPF\s*:?\s*\d+.*$',
-            r'^CNPJ\s*:?\s*\d+.*$',
+            
+            # Linhas de saldo (principais padrões)
+            r'^SALDO\s+ANTERIOR.*$',
+            r'^SALDO\s+ATUAL.*$',
+            r'^SALDO\s+INICIAL.*$',
+            r'^SALDO\s+FINAL.*$',
+            r'^SALDO\s+EM\s+.*$',
+            r'^SALDO.*\d{2}/\d{2}/\d{4}.*$',           # Saldo com data
+            r'.*SALDO\s+DO\s+DIA.*$',
+            r'.*SALDO\s+DISPONÍVEL.*$',
+            r'.*SALDO\s+BLOQUEADO.*$',
+            
+            # Totalizadores
+            r'^TOTAL\s+.*$',
+            r'^SUBTOTAL\s+.*$',
+            r'^RESUMO\s+.*$',
+            r'^TOTAIS\s+.*$',
+            r'^TOTAL\s+DE\s+CRÉDITOS.*$',
+            r'^TOTAL\s+DE\s+DÉBITOS.*$',
+            r'^MOVIMENTAÇÃO\s+TOTAL.*$',
+            
+            # Linhas de separação e formatação
             r'^\s*$',
             r'^-+$',
             r'^=+$',
             r'^\*+$',
-            r'^TOTAL\s+.*$',
-            r'^SUBTOTAL\s+.*$',
+            r'^\s*\|\s*$',
+            r'^\s*\+[\s\+\-]*\+\s*$',
+            
+            # Nomes de bancos
             r'^ITAÚ\s+.*$',
             r'^BANCO\s+DO\s+BRASIL.*$',
             r'^BRADESCO.*$',
@@ -140,6 +176,12 @@ class EnhancedBankMatcher(BankPatternMatcher):
             r'^PagBank.*$',
             r'^Picpay.*$',
             r'^Stone.*$',
+            
+            # Cabeçalhos de colunas
+            r'^DATA.*DESCRIÇÃO.*VALOR.*$',
+            r'^DATA.*HISTÓRICO.*VALOR.*$',
+            r'^DATA.*LANÇAMENTO.*VALOR.*$',
+            r'.*DÉBITO.*CRÉDITO.*SALDO.*$',
         ]
     
     def parse_transaction_line(self, line: str) -> Optional[Transaction]:
@@ -192,48 +234,97 @@ class EnhancedBankMatcher(BankPatternMatcher):
         # Busca por valores monetários com lógica aprimorada
         values = []
         value_matches = []
+        transaction_value = None
+        balance = None
         
         for pattern in self.get_value_patterns():
-            matches = list(re.finditer(pattern, line))
+            matches = list(re.finditer(pattern, line, re.IGNORECASE))
             for match in matches:
                 try:
-                    value_str = match.group(1).strip()
+                    full_match = match.group(0)
+                    value_part = match.group(1) if match.groups() else match.group(0)
                     
-                    # Processa diferentes formatos
-                    if value_str.endswith('C') or value_str.endswith('D'):
-                        is_debit = value_str.endswith('D')
-                        value_str = value_str[:-1].strip()
-                    else:
-                        is_debit = value_str.startswith('-') or 'débito' in line.lower() or 'saque' in line.lower()
+                    # Determina se é débito baseado em indicadores
+                    is_debit = False
                     
-                    # Remove sinais e espaços
-                    value_str = re.sub(r'[+\-\s]', '', value_str)
+                    # Verifica sinais explícitos
+                    if '-' in full_match or value_part.startswith('-'):
+                        is_debit = True
+                    elif '+' in full_match or value_part.startswith('+'):
+                        is_debit = False
+                    # Verifica indicadores C/D
+                    elif 'D' in full_match.upper():
+                        is_debit = True
+                    elif 'C' in full_match.upper():
+                        is_debit = False
+                    # Verifica contexto da linha para palavras-chave de débito
+                    elif any(word in line.lower() for word in [
+                        'débito', 'debito', 'saque', 'tarifa', 'taxa', 'juros', 'iof',
+                        'compra', 'pagamento', 'transferência enviada', 'ted enviada',
+                        'doc enviado', 'pix enviado'
+                    ]):
+                        is_debit = True
+                    # Verifica contexto para palavras-chave de crédito
+                    elif any(word in line.lower() for word in [
+                        'crédito', 'credito', 'depósito', 'deposito', 'recebimento',
+                        'salário', 'salario', 'transferência recebida', 'ted recebida',
+                        'doc recebido', 'pix recebido', 'rendimento'
+                    ]):
+                        is_debit = False
+                    
+                    # Limpa o valor numérico
+                    clean_value = re.sub(r'[^\d,.]', '', value_part)
+                    clean_value = clean_value.strip()
                     
                     # Converte formato brasileiro para float
-                    if ',' in value_str and '.' in value_str:
-                        # Formato 1.234,56
-                        value_str = value_str.replace('.', '').replace(',', '.')
-                    elif ',' in value_str and value_str.count(',') == 1:
-                        # Formato 1234,56
-                        value_str = value_str.replace(',', '.')
-                    # Se só tem pontos, assume formato americano ou milhares brasileiros
-                    elif '.' in value_str:
-                        parts = value_str.split('.')
-                        if len(parts[-1]) == 2:  # Último grupo tem 2 dígitos - decimal
-                            value_str = ''.join(parts[:-1]) + '.' + parts[-1]
-                        else:  # Separadores de milhares
-                            value_str = value_str.replace('.', '')
+                    if ',' in clean_value and '.' in clean_value:
+                        # Formato brasileiro: 1.234,56
+                        if clean_value.rindex(',') > clean_value.rindex('.'):
+                            clean_value = clean_value.replace('.', '').replace(',', '.')
+                        # Formato americano: 1,234.56
+                        else:
+                            clean_value = clean_value.replace(',', '')
+                    elif ',' in clean_value:
+                        # Apenas vírgula - formato brasileiro
+                        parts = clean_value.split(',')
+                        if len(parts) == 2 and len(parts[1]) == 2:  # decimal
+                            clean_value = clean_value.replace(',', '.')
+                        else:  # separador de milhares
+                            clean_value = clean_value.replace(',', '')
                     
-                    value = float(value_str)
-                    if is_debit:
-                        value = -abs(value)
-                    
-                    values.append(value)
-                    value_matches.append(match)
-                except (ValueError, AttributeError):
+                    try:
+                        value = float(clean_value)
+                        if is_debit:
+                            value = -abs(value)
+                        
+                        # Classifica se é valor de transação ou saldo
+                        # Saldos geralmente são maiores e aparecem no final da linha
+                        position = match.start()
+                        line_length = len(line)
+                        is_likely_balance = (
+                            position > line_length * 0.7 and  # Aparece na parte final da linha
+                            abs(value) > 100  # Valores de saldo geralmente são maiores
+                        )
+                        
+                        if transaction_value is None:
+                            transaction_value = value
+                        elif is_likely_balance and balance is None:
+                            balance = abs(value)  # Saldo sempre positivo
+                        else:
+                            values.append(value)
+                        
+                        value_matches.append(match)
+                        
+                    except ValueError:
+                        continue
+                        
+                except (ValueError, AttributeError, IndexError):
                     continue
         
-        if not values:
+        if transaction_value is None and values:
+            transaction_value = values[0]
+        
+        if transaction_value is None:
             return None
         
         # Extrai descrição removendo data e valores
@@ -242,28 +333,28 @@ class EnhancedBankMatcher(BankPatternMatcher):
             description = description[:date_match.start()] + description[date_match.end():]
         
         for match in value_matches:
-            start = match.start() - (date_match.end() - date_match.start() if date_match and match.start() > date_match.start() else 0)
-            end = match.end() - (date_match.end() - date_match.start() if date_match and match.start() > date_match.start() else 0)
+            # Ajusta posições considerando remoções anteriores
+            start = match.start()
+            end = match.end()
+            if date_match and match.start() > date_match.start():
+                start -= (date_match.end() - date_match.start())
+                end -= (date_match.end() - date_match.start())
+            
             description = description[:max(0, start)] + description[end:]
         
         # Limpa a descrição
-        description = re.sub(r'[R\$\-\+\s]+', ' ', description)
+        description = re.sub(r'[R\$\-\+CD\s]+', ' ', description)
         description = re.sub(r'\s+', ' ', description).strip()
+        description = description.replace('  ', ' ')  # Remove espaços duplos
+        
+        # Remove palavras comuns de formatação
+        words_to_remove = ['saldo', 'anterior', 'atual', 'final', 'inicial']
+        description_words = description.split()
+        description_words = [word for word in description_words if word.lower() not in words_to_remove]
+        description = ' '.join(description_words)
         
         if not description or len(description) < 3:
             description = "Transação não identificada"
-        
-        # Determina valor principal e saldo
-        transaction_value = values[0]
-        balance = values[1] if len(values) > 1 else None
-        
-        # Se há múltiplos valores, tenta identificar qual é o saldo
-        if len(values) > 1:
-            # O saldo geralmente é o maior valor absoluto
-            max_value = max(values, key=abs)
-            if abs(max_value) > abs(transaction_value) * 2:  # Heurística simples
-                balance = max_value
-                transaction_value = [v for v in values if v != max_value][0]
         
         return Transaction(
             date=date_obj,
@@ -365,14 +456,45 @@ class BankStatementExtractor:
         cleaned_lines = self._remove_noise(lines)
         candidate_lines = self._identify_transaction_candidates(cleaned_lines)
         
-        # Parse das transações
+        # Parse das transações com validação adicional
         for line in candidate_lines:
             transaction = self.matcher.parse_transaction_line(line)
-            if transaction:
+            if transaction and self._is_valid_transaction(transaction, line):
                 transaction.source_file = filename
                 transactions.append(transaction)
         
         return transactions
+    
+    def _is_valid_transaction(self, transaction: Transaction, original_line: str) -> bool:
+        """Valida se a transação extraída é realmente uma transação e não um saldo"""
+        line_lower = original_line.lower()
+        
+        # Rejeita se contém palavras-chave de saldo
+        balance_indicators = [
+            'saldo anterior', 'saldo atual', 'saldo inicial', 'saldo final',
+            'saldo disponível', 'saldo bloqueado', 'saldo em conta',
+            'total de créditos', 'total de débitos', 'total geral',
+            'resumo do período', 'movimentação total'
+        ]
+        
+        if any(indicator in line_lower for indicator in balance_indicators):
+            return False
+        
+        # Rejeita se a descrição está muito vazia ou genérica
+        if not transaction.description or len(transaction.description.strip()) < 3:
+            return False
+        
+        # Rejeita se parece ser uma linha de cabeçalho
+        if any(word in line_lower for word in ['data', 'histórico', 'valor', 'descrição']):
+            word_count = len([w for w in ['data', 'histórico', 'valor', 'descrição', 'débito', 'crédito', 'saldo'] if w in line_lower])
+            if word_count >= 2:  # Se tem 2 ou mais palavras de cabeçalho
+                return False
+        
+        # Rejeita valores muito pequenos que podem ser artefatos
+        if abs(transaction.value) < 0.01:
+            return False
+        
+        return True
     
     def _remove_noise(self, lines: List[str]) -> List[str]:
         """Remove linhas que são claramente ruído"""
@@ -392,26 +514,54 @@ class BankStatementExtractor:
         return cleaned_lines
     
     def _identify_transaction_candidates(self, lines: List[str]) -> List[str]:
-        """Identifica linhas que podem conter transações usando heurísticas"""
+        """Identifica linhas que podem conter transações usando heurísticas aprimoradas"""
         candidates = []
         date_patterns = self.matcher.get_date_patterns()
         value_patterns = self.matcher.get_value_patterns()
         
+        # Palavras-chave que indicam linhas de saldo (para excluir)
+        balance_keywords = [
+            'saldo anterior', 'saldo atual', 'saldo inicial', 'saldo final',
+            'saldo disponível', 'saldo bloqueado', 'saldo do dia',
+            'total créditos', 'total débitos', 'total geral'
+        ]
+        
         for line in lines:
+            line_lower = line.lower()
+            
+            # Pula linhas que são claramente saldos ou totais
+            if any(keyword in line_lower for keyword in balance_keywords):
+                continue
+            
+            # Pula linhas muito curtas
+            if len(line.strip()) < 8:
+                continue
+            
             # Verifica se tem data
             has_date = any(re.search(pattern, line, re.IGNORECASE) for pattern in date_patterns)
             # Verifica se tem valor monetário
             has_value = any(re.search(pattern, line) for pattern in value_patterns)
             # Verifica se tem palavras-chave de transação
-            has_transaction_keywords = any(keyword in line.lower() for keyword in [
-                'pix', 'ted', 'doc', 'saque', 'depósito', 'transferência', 'compra', 'débito', 'crédito'
+            has_transaction_keywords = any(keyword in line_lower for keyword in [
+                'pix', 'ted', 'doc', 'saque', 'depósito', 'transferência', 'compra', 
+                'débito', 'crédito', 'pagamento', 'recebimento', 'tarifa', 'juros',
+                'rendimento', 'salário', 'cartão'
             ])
             
-            # Critérios para ser candidato
-            if (has_date and has_value) or \
-               (has_date and len(line.strip()) > 15) or \
-               (has_value and has_transaction_keywords) or \
-               (has_date and has_transaction_keywords):
+            # Critérios mais restritivos para ser candidato
+            is_candidate = False
+            
+            if has_date and has_value:
+                # Se tem data E valor, é forte candidato
+                is_candidate = True
+            elif has_date and has_transaction_keywords and len(line.strip()) > 15:
+                # Se tem data, palavras-chave e tamanho razoável
+                is_candidate = True
+            elif has_value and has_transaction_keywords and len(line.strip()) > 20:
+                # Se tem valor, palavras-chave e é linha substancial
+                is_candidate = True
+            
+            if is_candidate:
                 candidates.append(line)
         
         return candidates
@@ -602,6 +752,44 @@ def main():
                 # Gráficos
                 st.header("📈 Análises")
                 create_summary_charts(df)
+                
+                # Seção de Debug (opcional)
+                with st.expander("🔍 Informações de Debug", expanded=False):
+                    st.subheader("Estatísticas de Processamento")
+                    
+                    # Contagem por tipo
+                    tipo_counts = df['tipo'].value_counts()
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.write("**Tipos de Transação:**")
+                        for tipo, count in tipo_counts.items():
+                            st.write(f"- {tipo}: {count}")
+                    
+                    with col2:
+                        st.write("**Distribuição de Valores:**")
+                        positivos = len(df[df['valor'] > 0])
+                        negativos = len(df[df['valor'] < 0])
+                        st.write(f"- Valores positivos: {positivos}")
+                        st.write(f"- Valores negativos: {negativos}")
+                        st.write(f"- Proporção: {positivos/(positivos+negativos)*100:.1f}% positivos")
+                    
+                    # Amostra dos dados brutos
+                    st.subheader("Amostra dos Dados Extraídos")
+                    st.dataframe(df.head(10))
+                    
+                    # Valores extremos
+                    st.subheader("Valores Extremos")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write("**Maiores Valores:**")
+                        top_values = df.nlargest(5, 'valor')[['data', 'descricao', 'valor']]
+                        st.dataframe(top_values)
+                    
+                    with col2:
+                        st.write("**Menores Valores:**")
+                        bottom_values = df.nsmallest(5, 'valor')[['data', 'descricao', 'valor']]
+                        st.dataframe(bottom_values)
                 
                 # Tabela de dados
                 st.header("📋 Dados Extraídos")
