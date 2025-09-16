@@ -1,15 +1,14 @@
 """
-Extrator de Extratos Bancários (versão melhorada)
-Melhorias principais na classificação débito/crédito:
-- Análise mais precisa de padrões textuais
-- Melhor detecção de sinais e formatação
-- Heurísticas baseadas em contexto bancário brasileiro
-- Validação cruzada entre múltiplas evidências
+Extrator de Extratos Bancários - Versão Profissional
+Algoritmo robusto para múltiplos formatos bancários
+Correções principais:
+- Filtros rigorosos contra linhas de ruído
+- Parsers específicos por banco com validação
+- Detecção precisa de débito/crédito
+- Suporte a transações sem data repetida
+- Validação de consistência de dados
 """
 
-# ============================================================
-# 1) Importações e configuração inicial
-# ============================================================
 import streamlit as st
 import pandas as pd
 import re
@@ -19,7 +18,6 @@ from dataclasses import dataclass
 import logging
 import io
 
-# Bibliotecas opcionais
 try:
     import pdfplumber
     PDF_AVAILABLE = True
@@ -42,12 +40,8 @@ if not PDF_AVAILABLE:
     st.error("❌ pdfplumber não encontrado — instale `pdfplumber` para ativar leitura de PDFs.")
     st.stop()
 
-# Config Streamlit
-st.set_page_config(page_title="Extrator de Extratos Bancários (Melhorado)", page_icon="🏦", layout="wide")
+st.set_page_config(page_title="Extrator de Extratos Bancários - Profissional", page_icon="🏦", layout="wide")
 
-# ============================================================
-# 2) Estrutura que representa uma transação
-# ============================================================
 @dataclass
 class Transaction:
     date: datetime
@@ -57,70 +51,42 @@ class Transaction:
     transaction_type: Optional[str] = None
     category: Optional[str] = None
     source_file: Optional[str] = None
-    confidence_score: float = 0.0  # Nova: pontuação de confiança na classificação
+    source_bank: Optional[str] = None
+    confidence_score: float = 0.0
 
-# ============================================================
-# 3) Helper: parsing robusto de números monetários
-# ============================================================
 def parse_monetary_string(s: str) -> Optional[float]:
-    """
-    Converte uma string que representa dinheiro (BR/EN) em float.
-    Preserva o sinal original para análise posterior.
-    """
+    """Parse robusto de valores monetários"""
     if not s or not isinstance(s, str):
         return None
     
     original = s.strip()
-    s = original
     
-    # Detecta parênteses (formato contábil para negativo)
-    parentheses_negative = False
-    if s.startswith("(") and s.endswith(")"):
-        parentheses_negative = True
+    # Detecta parênteses (negativo)
+    parentheses_negative = original.startswith("(") and original.endswith(")")
+    if parentheses_negative:
         s = s[1:-1].strip()
     
     # Detecta sinal explícito
     explicit_negative = s.startswith("-")
     explicit_positive = s.startswith("+")
     
-    # Remove símbolos monetários e espaços
+    # Remove símbolos monetários
     s = re.sub(r"[Rr]\$|\s+", "", s)
-    
-    # Remove sinais para processamento
     s = s.lstrip("+-")
     
-    # Trata separadores decimais e de milhares
+    # Trata separadores
     if "." in s and "," in s:
-        # Determina qual é decimal pela posição
-        dot_pos = s.rfind(".")
-        comma_pos = s.rfind(",")
-        
-        if comma_pos > dot_pos:
-            # Vírgula é decimal: "1.234,56"
+        if s.rfind(",") > s.rfind("."):
             s = s.replace(".", "").replace(",", ".")
         else:
-            # Ponto é decimal: "1,234.56"
             s = s.replace(",", "")
-    elif "," in s and "." not in s:
-        # Só vírgula - verifica se é decimal
+    elif "," in s:
         parts = s.split(",")
         if len(parts) == 2 and len(parts[1]) == 2:
-            # Provavelmente decimal
             s = s.replace(",", ".")
         else:
-            # Provavelmente separador de milhares
             s = s.replace(",", "")
-    elif "." in s and "," not in s:
-        # Só ponto - verifica se é decimal
-        parts = s.split(".")
-        if len(parts) == 2 and len(parts[1]) == 2:
-            # Provavelmente decimal
-            pass
-        else:
-            # Provavelmente separador de milhares
-            s = s.replace(".", "")
     
-    # Remove qualquer caractere não numérico restante exceto ponto decimal
     s = re.sub(r"[^\d.]", "", s)
     
     if not s:
@@ -128,1265 +94,468 @@ def parse_monetary_string(s: str) -> Optional[float]:
     
     try:
         val = float(s)
-        # Aplica negativos detectados
         if parentheses_negative or explicit_negative:
             val = -abs(val)
         elif explicit_positive:
             val = abs(val)
-        
         return val
-    except Exception:
+    except:
         return None
 
-# ============================================================
-# 4) Matcher aprimorado com melhor classificação débito/crédito
-# ============================================================
-class EnhancedBankMatcher:
+class ProfessionalBankMatcher:
     def __init__(self):
-        # Padrões de data
-        self.date_patterns = [
-            r'\b\d{2}[\/\-\.]\d{2}[\/\-\.]\d{4}\b',
-            r'\b\d{2}[\/\-\.]\d{2}[\/\-\.]\d{2}\b',
-            r'\b\d{4}[\/\-\.]\d{2}[\/\-\.]\d{2}\b',
-            r'\b\d{1,2}\s+(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)\s+\d{4}\b',
-        ]
-        
-        # Padrão para valores monetários mais preciso
-        self.value_pattern = re.compile(
-            r'(\(?[+\-]?\s*(?:R\$)?\s*\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\)?\s*[CD]?)',
-            flags=re.IGNORECASE
-        )
-        
-        # Padrões de ruído
+        # Padrões de ruído rigorosos
         self.noise_patterns = [
-            r'^SALDO\b', r'\bSALDO\s+(ANTERIOR|ATUAL|FINAL)\b', 
-            r'^TOTAL\b', r'\bTOTAL\s+DE\b', r'EXTRATO', r'PÁGINA', 
-            r'AGÊNCIA', r'CONTA', r'^DATA\b.*VALOR\b', r'^DESCRIÇÃO\b',
-            r'^(CRÉDITO|CRÉDITOS|DÉBITO|DÉBITOS)$',
-            r'MOVIMENTAÇÃO\s+TOTAL', r'RESUMO\s+DO\s+PERÍODO'
+            r'^(SALDO|TOTAL|SUBTOTAL|RESUMO|EXTRATO|PÁGINA|AGÊNCIA|CONTA|DATA|DESCRIÇÃO|PERÍODO|CLIENTE)',
+            r'(DISPONÍVEL|BLOQUEADO|LIMITE|VENCIMENTO|TAXA|JUROS)',
+            r'(CRÉDITO|CRÉDITOS|DÉBITO|DÉBITOS)$',
+            r'(MOVIMENTAÇÃO|LANÇAMENTO|HISTÓRICO)\s+(TOTAL|DO\s+PERÍODO)',
+            r'^\s*[-=_*]{3,}\s*$',
+            r'^\s*\d+\s+of\s+\d+\s*$',
+            r'(SAC|OUVIDORIA|TELEFONE|ATENDIMENTO)',
+            r'(CNPJ|CPF):\s*[\d/.()-]+\s*$',
+            r'^\s*(Períodos?|Data/Hora|Saldo\s+em|Opção\s+de)',
+            r'(www\.|http|\.com|\.br)',
+            r'^\s*\d{2}/\d{2}/\d{4}\s*$',  # Só data
+            r'^\s*R\$\s*[\d.,]+\s*$',      # Só valor
         ]
-        
-        # Palavras-chave para débito (mais específicas)
-        self.strong_debit_indicators = [
-            # Saques e retiradas
-            'saque', 'retirada', 'atm', 'caixa eletrônico', 'autoatendimento',
-            # Pagamentos
-            'pagamento', 'pagto', 'pago', 'quitação',
-            # Transferências de saída
-            'ted enviada', 'doc enviado', 'pix enviado', 'transferência enviada',
-            'transf enviada', 'envio pix', 'envio ted',
-            # Tarifas e taxas
-            'tarifa', 'taxa', 'juros', 'iof', 'anuidade', 'mensalidade',
-            # Compras
-            'compra', 'débito automático', 'débito em conta', 'cartão de débito',
-            # Outros débitos
-            'cobrança', 'desconto', 'estorno débito'
-        ]
-        
-        self.moderate_debit_indicators = [
-            'débito', 'debito', 'saída', 'retirar', 'pagar', 'comprar',
-            'transferir', 'enviar', 'remessa'
-        ]
-        
-        # Palavras-chave para crédito (mais específicas)
-        self.strong_credit_indicators = [
-            # Depósitos e recebimentos
-            'depósito', 'deposito', 'recebimento', 'receber',
-            # Transferências de entrada
-            'ted recebida', 'doc recebido', 'pix recebido', 'transferência recebida',
-            'transf recebida', 'recebimento pix', 'recebimento ted',
-            # Salários e rendimentos
-            'salário', 'salario', 'rendimento', 'juros sobre saldo',
-            'remuneração', 'provento', 'dividendo',
-            # Estornos de crédito
-            'estorno crédito', 'ressarcimento', 'reembolso',
-            # Outros créditos
-            'creditado', 'entrada', 'aplicação resgatada'
-        ]
-        
-        self.moderate_credit_indicators = [
-            'crédito', 'credito', 'entrada', 'receber', 'depositar',
-            'transferir para', 'recebimento de'
-        ]
-        
-        # Padrões que indicam formatação de débito
-        self.debit_formatting_patterns = [
-            r'\(\s*\d+[.,]\d{2}\s*\)',  # (123,45)
-            r'-\s*\d+[.,]\d{2}',        # -123,45
-            r'\d+[.,]\d{2}\s*D\b',      # 123,45 D
-            r'D\s*\d+[.,]\d{2}',        # D 123,45
-            r'\d+[.,]\d{2}\s*-',        # 123,45-
-        ]
-        
-        # Padrões que indicam formatação de crédito  
-        self.credit_formatting_patterns = [
-            r'\+\s*\d+[.,]\d{2}',       # +123,45
-            r'\d+[.,]\d{2}\s*C\b',      # 123,45 C
-            r'C\s*\d+[.,]\d{2}',        # C 123,45
-            r'\d+[.,]\d{2}\s*\+',       # 123,45+
-        ]
-
+    
     def is_noise_line(self, line: str) -> bool:
-        """Identifica linhas que são ruído (saldos, totais, cabeçalhos)"""
+        """Filtro rigoroso contra ruído"""
         if not line or len(line.strip()) < 3:
             return True
         
-        # Verifica padrões explícitos de ruído
+        line_clean = line.strip()
+        
+        # Padrões explícitos de ruído
         for pattern in self.noise_patterns:
-            if re.search(pattern, line, flags=re.IGNORECASE):
+            if re.search(pattern, line_clean, re.IGNORECASE):
                 return True
         
-        # Verifica palavras-chave de ruído
-        lower = line.lower().strip()
-        noise_keywords = [
-            'saldo anterior', 'saldo atual', 'saldo final',
-            'total de créditos', 'total de débitos', 'total geral',
-            'subtotal', 'soma dos', 'movimentação do período'
-        ]
-        
-        if any(keyword in lower for keyword in noise_keywords):
+        # Linhas muito curtas ou só números/símbolos
+        if len(line_clean) < 10 or re.match(r'^[\d\s.,/-]+$', line_clean):
             return True
-            
+        
+        # Linhas de cabeçalho/rodapé
+        if any(word in line_clean.lower() for word in ['cabeçalho', 'rodapé', 'header', 'footer']):
+            return True
+        
         return False
+    
+    def detect_bank_format(self, content_lines: List[str]) -> str:
+        """Detecção robusta baseada em múltiplas linhas"""
+        content = '\n'.join(content_lines[:50])  # Analisa primeiras 50 linhas
+        
+        # Banco do Brasil
+        if re.search(r'BB\s+Rende\s+Fácil|Transferência\s+enviada|Folha\s+de\s+Pagamento', content, re.IGNORECASE):
+            return 'BB'
+        
+        # Bradesco
+        if re.search(r'RESGATE\s+INVEST\s+FACIL|GASTOS\s+CARTAO\s+DE\s+CREDITO', content, re.IGNORECASE):
+            return 'BRADESCO'
+        
+        # Banco Inter
+        if re.search(r'Banco\s+Inter|Saldo\s+do\s+dia:\s+R\$|Pix\s+(enviado|recebido):', content, re.IGNORECASE):
+            return 'INTER'
+        
+        # Caixa
+        if re.search(r'SAC\s+CAIXA|CRED\s+TED|PAG\s+BOLETO|ENVIO\s+PIX', content, re.IGNORECASE):
+            return 'CAIXA'
+        
+        # XP Investimentos
+        if re.search(r'XP\s+INVESTIMENTOS|RESGATE.*FIRF|TED\s+BCO\s+\d+', content, re.IGNORECASE):
+            return 'XP'
+        
+        # Itaú
+        if re.search(r'BOLETO\s+PAGO|PIX\s+ENVIADO.*\d{2}\s*/\s*dez|SISPAG', content, re.IGNORECASE):
+            return 'ITAU'
+        
+        # Santander
+        if re.search(r'TED\s+RECEBIDA.*\d{11}|APLICACAO\s+CONTAMAX|PIX\s+ENVIADO.*ML', content, re.IGNORECASE):
+            return 'SANTANDER'
+        
+        # Sicoob
+        if re.search(r'SICOOB|PIX\s+RECEB\.OUTRA\s+IF|CRÉD\.TED-STR', content, re.IGNORECASE):
+            return 'SICOOB'
+        
+        # Nubank
+        if re.search(r'Nu\s+Financeira|Nu\s+Pagamentos|VL\s+REPRESENTACAO', content, re.IGNORECASE):
+            return 'NUBANK'
+        
+        return 'GENERIC'
 
-    def find_date(self, line: str) -> Optional[re.Match]:
-        """Encontra padrão de data na linha"""
-        for pattern in self.date_patterns:
-            match = re.search(pattern, line, flags=re.IGNORECASE)
-            if match:
-                return match
-        return None
-
-    def parse_date_from_match(self, match: re.Match) -> Optional[datetime]:
-        """Converte match de data para datetime"""
-        date_str = match.group().strip()
-        
-        # Tenta formato com mês abreviado em português
-        month_abbr_pattern = r'(\d{1,2})\s+(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)\s+(\d{4})'
-        month_match = re.match(month_abbr_pattern, date_str.lower())
-        
-        if month_match:
-            day = int(month_match.group(1))
-            month_abbr = month_match.group(2)
-            year = int(month_match.group(3))
-            
-            months = {
-                'jan': 1, 'fev': 2, 'mar': 3, 'abr': 4, 'mai': 5, 'jun': 6,
-                'jul': 7, 'ago': 8, 'set': 9, 'out': 10, 'nov': 11, 'dez': 12
-            }
-            
-            try:
-                return datetime(year, months[month_abbr], day)
-            except (ValueError, KeyError):
-                pass
-        
-        # Tenta formatos padrão
-        formats = ['%d/%m/%Y', '%d/%m/%y', '%Y-%m-%d', '%d-%m-%Y']
-        
-        for fmt in formats:
-            try:
-                return datetime.strptime(date_str, fmt)
-            except ValueError:
-                continue
-        
-        return None
-
-    def extract_value_matches(self, line: str) -> List[Dict]:
-        """Extrai todos os valores monetários da linha com contexto"""
-        matches = []
-        
-        for match in self.value_pattern.finditer(line):
-            value_text = match.group(1).strip()
-            parsed_value = parse_monetary_string(value_text)
-            
-            if parsed_value is not None:
-                # Contexto antes e depois do valor
-                start, end = match.span(1)
-                context_before = line[max(0, start-20):start].lower()
-                context_after = line[end:min(len(line), end+20)].lower()
-                
-                matches.append({
-                    'start': start,
-                    'end': end,
-                    'text': value_text,
-                    'value': parsed_value,
-                    'context_before': context_before,
-                    'context_after': context_after
-                })
-        
-        return matches
-
-    def classify_debit_credit_improved(self, line: str, value_info: Dict) -> Tuple[bool, float]:
-        """
-        Classificação melhorada de débito/crédito especialmente para extratos do BB.
-        Retorna (is_debit: bool, confidence: float)
-        """
-        line_lower = line.lower()
-        value_text = value_info['text'].lower()
-        context_before = value_info['context_before']
-        context_after = value_info['context_after']
-        full_line = line.strip()
-        
-        confidence_score = 0.0
-        debit_score = 0.0
-        credit_score = 0.0
-        
-        # 1. ANÁLISE ESPECÍFICA PARA FORMATO BB - Sufixos D/C no final da linha
-        # Padrão: "valor D saldo" ou "valor C saldo"  
-        dc_pattern = re.search(r'(\d+(?:[.,]\d+)*)\s*([DC])\s+(\d+(?:[.,]\d+)*)\s*([DC])?', full_line, re.IGNORECASE)
-        if dc_pattern:
-            valor_dc = dc_pattern.group(2).upper()
-            if valor_dc == 'D':
-                debit_score += 0.5
-                confidence_score += 0.4
-            elif valor_dc == 'C':
-                credit_score += 0.5
-                confidence_score += 0.4
-        
-        # 2. Análise do saldo final da linha (padrão BB: valor operação + D/C + saldo + C)
-        # Ex: "1.306,10 C" or "1.925,00 D"
-        saldo_pattern = re.search(r'(\d+(?:[.,]\d+)*)\s*([DC])\s*
-
-    def identify_transaction_and_balance(self, value_matches: List[Dict], line: str) -> Tuple[Dict, Dict]:
-        """
-        Identifica qual valor é a transação e qual é o saldo.
-        Retorna (transaction_value_info, balance_value_info)
-        """
-        if len(value_matches) == 1:
-            return value_matches[0], None
-        
-        line_len = len(line)
-        
-        # Ordena por posição
-        sorted_matches = sorted(value_matches, key=lambda x: x['start'])
-        
-        # Heurísticas para identificar saldo
-        balance_candidate = None
-        
-        for i, match in enumerate(sorted_matches):
-            # Saldo geralmente aparece no final da linha
-            if match['start'] > line_len * 0.7:
-                # Verifica se contexto indica saldo
-                context = match['context_after']
-                if any(word in context for word in ['saldo', 'sld']):
-                    balance_candidate = match
-                    break
-                # Se é o último valor e está no final, provavelmente é saldo
-                elif i == len(sorted_matches) - 1:
-                    balance_candidate = match
-                    break
-        
-        # Remove saldo da lista de candidatos a transação
-        transaction_candidates = [m for m in sorted_matches if m != balance_candidate]
-        
-        if transaction_candidates:
-            # Escolhe o primeiro candidato restante como transação
-            transaction_value = transaction_candidates[0]
-        else:
-            # Se não há candidatos, usa o primeiro valor como transação
-            transaction_value = sorted_matches[0]
-            balance_candidate = None
-        
-        return transaction_value, balance_candidate
-
-    def clean_description(self, line: str, date_match: re.Match, value_matches: List[Dict]) -> str:
-        """Limpa a descrição removendo datas, valores e ruído"""
-        # Cria máscara para marcar caracteres a remover
-        mask = [False] * len(line)
-        
-        # Marca posição da data
-        if date_match:
-            for i in range(date_match.start(), date_match.end()):
-                if i < len(mask):
-                    mask[i] = True
-        
-        # Marca posições dos valores
-        for match in value_matches:
-            for i in range(match['start'], min(match['end'], len(mask))):
-                mask[i] = True
-        
-        # Constrói descrição sem caracteres marcados
-        description = ''.join(char if not mask[i] else ' ' for i, char in enumerate(line))
-        
-        # Limpeza adicional
-        description = re.sub(r'[Rr]\$|\(|\)|[CD]\b|\bD\b|\bC\b', ' ', description)
-        description = re.sub(r'[:\-•*=]+', ' ', description)
-        description = re.sub(r'\s+', ' ', description).strip()
-        
-        # Remove palavras de ruído remanescentes
-        noise_words = ['saldo', 'total', 'subtotal', 'resumo', 'extrato', 'anterior', 'atual', 'final']
-        for word in noise_words:
-            description = re.sub(rf'\b{word}\b', ' ', description, flags=re.IGNORECASE)
-        
-        description = re.sub(r'\s+', ' ', description).strip()
-        
-        if len(description) < 3:
-            description = "Transação não identificada"
-        
-        return description
-
-    def classify_transaction_type(self, description: str, value: float) -> str:
-        """Classifica o tipo de transação baseado na descrição e valor"""
-        desc_lower = description.lower()
-        
-        if value < 0:  # Débitos
-            if any(word in desc_lower for word in ['pix', 'ted', 'doc', 'transferência', 'transf']):
-                if any(word in desc_lower for word in ['enviado', 'enviada', 'para', 'pagto']):
-                    return 'TRANSFERÊNCIA_SAÍDA'
-            
-            if any(word in desc_lower for word in ['saque', 'atm', 'caixa eletrônico', 'retirada']):
-                return 'SAQUE'
-            
-            if any(word in desc_lower for word in ['compra', 'débito automático', 'cartão']):
-                return 'COMPRA_DÉBITO'
-            
-            if any(word in desc_lower for word in ['tarifa', 'taxa', 'juros', 'iof', 'anuidade']):
-                return 'TARIFA'
-            
-            if any(word in desc_lower for word in ['pagamento', 'pagto', 'boleto']):
-                return 'PAGAMENTO'
-            
-            return 'DÉBITO'
-        
-        else:  # Créditos
-            if any(word in desc_lower for word in ['pix', 'ted', 'doc', 'transferência', 'transf']):
-                if any(word in desc_lower for word in ['recebido', 'recebida', 'de']):
-                    return 'TRANSFERÊNCIA_ENTRADA'
-            
-            if any(word in desc_lower for word in ['salário', 'salario', 'remuneração']):
-                return 'SALÁRIO'
-            
-            if any(word in desc_lower for word in ['depósito', 'deposito']):
-                return 'DEPÓSITO'
-            
-            if any(word in desc_lower for word in ['rendimento', 'juros', 'remuneração']):
-                return 'RENDIMENTO'
-            
-            if any(word in desc_lower for word in ['estorno', 'reembolso', 'ressarcimento']):
-                return 'ESTORNO'
-            
-            return 'CRÉDITO'
-
-    def categorize_transaction(self, description: str) -> str:
-        """Categoriza a transação baseado na descrição"""
-        desc_lower = description.lower()
-        
-        # Alimentação
-        food_keywords = ['restaurante', 'lanche', 'mercado', 'supermercado', 'padaria', 
-                        'ifood', 'uber eats', 'delivery', 'açougue', 'pizzaria']
-        if any(word in desc_lower for word in food_keywords):
-            return 'ALIMENTAÇÃO'
-        
-        # Transporte
-        transport_keywords = ['uber', '99', 'combustível', 'posto', 'gasolina', 'diesel',
-                             'estacionamento', 'pedágio', 'ônibus', 'metrô', 'taxi']
-        if any(word in desc_lower for word in transport_keywords):
-            return 'TRANSPORTE'
-        
-        # Casa
-        home_keywords = ['energia', 'luz', 'água', 'gas', 'telefone', 'internet', 
-                        'condomínio', 'aluguel', 'financiamento', 'iptu']
-        if any(word in desc_lower for word in home_keywords):
-            return 'CASA'
-        
-        # Saúde
-        health_keywords = ['farmácia', 'hospital', 'médico', 'dentista', 'clínica',
-                          'laboratório', 'exame', 'consulta', 'plano de saúde']
-        if any(word in desc_lower for word in health_keywords):
-            return 'SAÚDE'
-        
-        # Lazer
-        leisure_keywords = ['netflix', 'spotify', 'cinema', 'teatro', 'show', 'bar',
-                           'festa', 'viagem', 'hotel', 'turismo']
-        if any(word in desc_lower for word in leisure_keywords):
-            return 'LAZER'
-        
-        # Compras
-        shopping_keywords = ['americanas', 'mercado livre', 'amazon', 'magazine', 
-                            'shopping', 'loja', 'compra']
-        if any(word in desc_lower for word in shopping_keywords):
-            return 'COMPRAS'
-        
-        # Educação
-        education_keywords = ['escola', 'universidade', 'curso', 'faculdade', 'colégio']
-        if any(word in desc_lower for word in education_keywords):
-            return 'EDUCAÇÃO'
-        
-        return 'OUTROS'
-
-    def parse_transaction_line(self, line: str) -> Optional[Transaction]:
-        """Parse principal de uma linha para extrair transação"""
-        if not line or len(line.strip()) < 6:
-            return None
-        
-        if self.is_noise_line(line):
-            return None
-        
-        # 1. Encontra data
-        date_match = self.find_date(line)
-        if not date_match:
-            return None
-        
-        date_obj = self.parse_date_from_match(date_match)
-        if not date_obj:
-            return None
-        
-        # 2. Extrai valores monetários
-        value_matches = self.extract_value_matches(line)
-        if not value_matches:
-            return None
-        
-        # 3. Identifica transação e saldo
-        transaction_value_info, balance_value_info = self.identify_transaction_and_balance(value_matches, line)
-        
-        # 4. Classifica débito/crédito
-        is_debit, confidence = self.classify_debit_credit_improved(line, transaction_value_info)
-        
-        # 5. Ajusta o valor conforme classificação
-        transaction_value = transaction_value_info['value']
-        if is_debit and transaction_value > 0:
-            transaction_value = -abs(transaction_value)
-        elif not is_debit and transaction_value < 0:
-            transaction_value = abs(transaction_value)
-        
-        # 6. Extrai saldo se identificado
-        balance_value = None
-        if balance_value_info:
-            balance_value = abs(balance_value_info['value'])  # Saldo sempre positivo
-        
-        # 7. Limpa descrição
-        description = self.clean_description(line, date_match, value_matches)
-        
-        # 8. Classifica tipo e categoria
-        transaction_type = self.classify_transaction_type(description, transaction_value)
-        category = self.categorize_transaction(description)
-        
-        return Transaction(
-            date=date_obj,
-            description=description,
-            value=transaction_value,
-            balance=balance_value,
-            transaction_type=transaction_type,
-            category=category,
-            confidence_score=confidence
-        )
-
-# ============================================================
-# 5) Extrator principal
-# ============================================================
-class BankStatementExtractor:
-    def __init__(self, matcher: Optional[EnhancedBankMatcher] = None):
-        self.matcher = matcher or EnhancedBankMatcher()
-
-    def extract_from_pdf_bytes(self, pdf_bytes: bytes, filename: str) -> pd.DataFrame:
-        """Extrai transações de PDF em bytes"""
-        try:
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                all_lines = []
-                for page in pdf.pages:
-                    text = page.extract_text()
-                    if text:
-                        all_lines.extend(text.splitlines())
-            
-            transactions = self._process_lines(all_lines)
-            df = self._transactions_to_dataframe(transactions)
-            
-            if not df.empty:
-                df['arquivo'] = filename
-            
-            return df
-        
-        except Exception as e:
-            logger.exception(f"Erro ao processar PDF {filename}: {e}")
-            return pd.DataFrame()
-
-    def _process_lines(self, lines: List[str]) -> List[Transaction]:
-        """Processa linhas extraindo transações válidas"""
+class BankParser:
+    def __init__(self):
+        self.current_date = None  # Para bancos que não repetem data
+    
+    def parse_bb(self, lines: List[str]) -> List[Transaction]:
+        """Parser Banco do Brasil - formato estruturado"""
         transactions = []
         
         for line in lines:
-            if not line or len(line.strip()) < 6:
+            if len(line.strip()) < 20:
                 continue
             
-            transaction = self.matcher.parse_transaction_line(line)
-            if transaction and self._is_valid_transaction(transaction):
-                transactions.append(transaction)
-        
-        return transactions
-
-    def _is_valid_transaction(self, transaction: Transaction) -> bool:
-        """Valida se a transação é legítima"""
-        if not transaction:
-            return False
-        
-        # Valor deve existir e ter magnitude mínima
-        if transaction.value is None or abs(transaction.value) < 0.01:
-            return False
-        
-        # Descrição deve ser significativa
-        if not transaction.description or len(transaction.description.strip()) < 3:
-            return False
-        
-        # Confiança mínima na classificação
-        if transaction.confidence_score < 0.1:
-            return False
-        
-        return True
-
-    def _transactions_to_dataframe(self, transactions: List[Transaction]) -> pd.DataFrame:
-        """Converte lista de transações para DataFrame"""
-        if not transactions:
-            return pd.DataFrame()
-        
-        data = []
-        for t in transactions:
-            data.append({
-                'data': t.date,
-                'descricao': t.description,
-                'valor': t.value,
-                'saldo': t.balance,
-                'tipo': t.transaction_type,
-                'categoria': t.category,
-                'confianca': t.confidence_score
-            })
-        
-        df = pd.DataFrame(data)
-        
-        # Normalização e ordenação
-        df['data'] = pd.to_datetime(df['data'])
-        df = df.sort_values('data').reset_index(drop=True)
-        
-        # Colunas auxiliares
-        df['mes'] = df['data'].dt.month
-        df['ano'] = df['data'].dt.year
-        df['dia_semana'] = df['data'].dt.day_name()
-        df['valor_absoluto'] = df['valor'].abs()
-        df['mes_ano'] = df['data'].dt.to_period('M').astype(str)
-        df['eh_debito'] = df['valor'] < 0
-        df['eh_credito'] = df['valor'] > 0
-        
-        return df
-
-# ============================================================
-# 6) Processamento de múltiplos PDFs
-# ============================================================
-def process_multiple_pdfs(uploaded_files):
-    """Processa múltiplos arquivos PDF"""
-    extractor = BankStatementExtractor()
-    all_dfs = []
-    
-    progress = st.progress(0)
-    status = st.empty()
-    
-    for i, uploaded_file in enumerate(uploaded_files):
-        status.text(f'Processando {uploaded_file.name} ({i+1}/{len(uploaded_files)})')
-        
-        try:
-            pdf_bytes = uploaded_file.read()
-            df = extractor.extract_from_pdf_bytes(pdf_bytes, uploaded_file.name)
-            
-            if df.empty:
-                st.warning(f"⚠️ {uploaded_file.name}: nenhuma transação identificada")
-            else:
-                all_dfs.append(df)
-                avg_confidence = df['confianca'].mean()
-                banco_detectado = extractor.detected_banks.get(uploaded_file.name, 'N/A')
-                st.success(f"✅ {uploaded_file.name}: {len(df)} transações | Banco: **{banco_detectado}** | Confiança: {avg_confidence:.2f}")
-        
-        except Exception as e:
-            st.error(f"❌ Erro ao processar {uploaded_file.name}: {e}")
-        
-        progress.progress((i + 1) / len(uploaded_files))
-    
-    status.text("Processamento concluído")
-    
-    if all_dfs:
-        combined = pd.concat(all_dfs, ignore_index=True)
-        combined = combined.sort_values('data').reset_index(drop=True)
-        return combined, extractor.detected_banks
-    
-    return pd.DataFrame(), {}
-
-# ============================================================
-# 7) Análises e gráficos
-# ============================================================
-def create_summary_charts(df):
-    """Cria gráficos de resumo"""
-    if df.empty or not PLOTLY_AVAILABLE:
-        if not PLOTLY_AVAILABLE:
-            st.warning("Plotly não disponível — gráficos desabilitados")
-        return
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Fluxo de caixa mensal
-        monthly = df.groupby('mes_ano')['valor'].sum().reset_index()
-        monthly['mes_ano_dt'] = pd.to_datetime(monthly['mes_ano'] + '-01')
-        monthly = monthly.sort_values('mes_ano_dt')
-        
-        fig1 = px.line(
-            monthly, 
-            x='mes_ano_dt', 
-            y='valor',
-            title='Fluxo de Caixa Mensal',
-            labels={'valor': 'Valor (R$)', 'mes_ano_dt': 'Mês'}
-        )
-        fig1.add_hline(y=0, line_dash='dash', line_color='red', annotation_text="Zero")
-        fig1.update_layout(xaxis_title="Período", yaxis_title="Valor (R$)")
-        st.plotly_chart(fig1, use_container_width=True)
-    
-    with col2:
-        # Gastos por categoria (apenas débitos)
-        debits = df[df['valor'] < 0].copy()
-        if not debits.empty:
-            category_spending = debits.groupby('categoria')['valor'].sum().abs().reset_index()
-            category_spending = category_spending.sort_values('valor', ascending=False)
-            
-            fig2 = px.bar(
-                category_spending,
-                x='categoria',
-                y='valor',
-                title='Gastos por Categoria',
-                labels={'valor': 'Valor (R$)', 'categoria': 'Categoria'}
+            # Padrão BB: DATA AGENCIA LOTE HISTORICO DOCUMENTO VALOR D/C [SALDO D/C]
+            bb_pattern = re.compile(
+                r'(\d{2}/\d{2}/\d{4})\s+'     # data
+                r'(\d{4})\s+'                 # agencia
+                r'(\d{5})\s+'                 # lote
+                r'(.+?)\s+'                   # historico
+                r'([\d.,]+)\s+'               # documento ou valor
+                r'([\d.,]+)\s*([CD])\s*'      # valor final + D/C
+                r'(?:([\d.,]+)\s*([CD]))?',   # saldo opcional
+                re.IGNORECASE
             )
-            fig2.update_xaxes(tickangle=45)
-            st.plotly_chart(fig2, use_container_width=True)
-
-def create_confidence_analysis(df):
-    """Análise de confiança das classificações"""
-    if df.empty:
-        return
-    
-    st.subheader("📊 Análise de Confiança na Classificação")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        avg_confidence = df['confianca'].mean()
-        st.metric("Confiança Média", f"{avg_confidence:.2f}")
-    
-    with col2:
-        high_confidence = (df['confianca'] >= 0.7).sum()
-        st.metric("Alta Confiança (≥0.7)", f"{high_confidence} ({high_confidence/len(df)*100:.1f}%)")
-    
-    with col3:
-        low_confidence = (df['confianca'] < 0.3).sum()
-        st.metric("Baixa Confiança (<0.3)", f"{low_confidence} ({low_confidence/len(df)*100:.1f}%)")
-    
-    if PLOTLY_AVAILABLE:
-        # Histograma de confiança
-        fig = px.histogram(
-            df,
-            x='confianca',
-            bins=20,
-            title='Distribuição da Confiança na Classificação',
-            labels={'confianca': 'Confiança', 'count': 'Quantidade'}
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Confiança por tipo de transação
-        confidence_by_type = df.groupby('tipo')['confianca'].agg(['mean', 'count']).reset_index()
-        confidence_by_type.columns = ['tipo', 'confianca_media', 'quantidade']
-        
-        fig2 = px.bar(
-            confidence_by_type,
-            x='tipo',
-            y='confianca_media',
-            title='Confiança Média por Tipo de Transação',
-            labels={'confianca_media': 'Confiança Média', 'tipo': 'Tipo'}
-        )
-        fig2.update_xaxes(tickangle=45)
-        st.plotly_chart(fig2, use_container_width=True)
-
-def show_classification_review(df):
-    """Interface para revisão das classificações"""
-    if df.empty:
-        return
-    
-    st.subheader("🔍 Revisão de Classificações")
-    
-    # Filtros para revisão
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        confidence_threshold = st.slider(
-            "Mostrar transações com confiança menor que:",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.5,
-            step=0.1
-        )
-    
-    with col2:
-        show_type = st.selectbox(
-            "Filtrar por tipo:",
-            ['Todos'] + df['tipo'].unique().tolist()
-        )
-    
-    # Aplica filtros
-    filtered = df[df['confianca'] < confidence_threshold]
-    if show_type != 'Todos':
-        filtered = filtered[filtered['tipo'] == show_type]
-    
-    if not filtered.empty:
-        st.write(f"Encontradas {len(filtered)} transações para revisão:")
-        
-        # Mostra transações para revisão
-        review_cols = ['data', 'descricao', 'valor', 'tipo', 'categoria', 'confianca']
-        st.dataframe(
-            filtered[review_cols].sort_values('confianca'),
-            use_container_width=True
-        )
-    else:
-        st.info("Nenhuma transação encontrada com os critérios selecionados.")
-
-# ============================================================
-# 8) Interface Streamlit principal
-# ============================================================
-def main():
-    st.title("🏦 Extrator de Extratos Bancários - Versão Melhorada")
-    st.markdown("""
-    Esta versão aprimorada oferece:
-    - **Melhor detecção de débito/crédito** com múltiplas heurísticas
-    - **Pontuação de confiança** para cada classificação
-    - **Análise de padrões** bancários brasileiros
-    - **Interface de revisão** para classificações duvidosas
-    """)
-
-    with st.sidebar:
-        st.header("📋 Instruções")
-        st.markdown("""
-        ### Como usar:
-        1. Faça upload de PDFs de extratos bancários
-        2. Aguarde o processamento automático
-        3. Revise as classificações na aba de análise
-        4. Baixe os dados processados
-        
-        ### Melhorias desta versão:
-        - ✅ Detecção aprimorada de sinais (-, +, parênteses)
-        - ✅ Reconhecimento de padrões D/C
-        - ✅ Análise contextual de palavras-chave
-        - ✅ Identificação de PIX, TED, DOC
-        - ✅ Pontuação de confiança
-        """)
-        
-        st.header("ℹ️ Informações")
-        st.info("""
-        **Confiança na classificação:**
-        - 0.7+ : Alta confiança
-        - 0.3-0.7 : Média confiança  
-        - <0.3 : Baixa confiança
-        """)
-
-    # Upload de arquivos
-    uploaded_files = st.file_uploader(
-        "Escolha arquivos PDF de extratos bancários",
-        type="pdf",
-        accept_multiple_files=True,
-        help="Selecione um ou mais arquivos PDF de extratos bancários"
-    )
-
-    if uploaded_files:
-            if st.button("🚀 Processar Extratos", type="primary"):
-            with st.spinner("Processando extratos..."):
-                df, detected_banks = process_multiple_pdfs(uploaded_files)
             
-            if df.empty:
-                st.error("❌ Nenhuma transação foi extraída. Verifique se os PDFs contêm extratos bancários válidos.")
-                return
-
-            # Métricas principais
-            st.success(f"✅ Processamento concluído — {len(df)} transações extraídas")
+            match = bb_pattern.search(line)
+            if not match:
+                continue
             
-            # Mostrar bancos detectados
-            if detected_banks:
-                st.info("🏦 **Bancos detectados:** " + " | ".join([f"{arquivo}: {banco}" for arquivo, banco in detected_banks.items()]))
-            
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.metric("Total de Transações", len(df))
-            
-            with col2:
-                total_credits = df[df['valor'] > 0]['valor'].sum()
-                st.metric("Total Créditos", f"R$ {total_credits:,.2f}")
-            
-            with col3:
-                total_debits = df[df['valor'] < 0]['valor'].sum()
-                st.metric("Total Débitos", f"R$ {total_debits:,.2f}")
-            
-            with col4:
-                net_flow = df['valor'].sum()
-                st.metric("Fluxo Líquido", f"R$ {net_flow:,.2f}")
-            
-            # Abas de análise
-            tab1, tab2, tab3, tab4 = st.tabs(["📈 Resumo", "🔍 Análise de Confiança", "📝 Revisão", "📊 Dados"])
-            
-            with tab1:
-                st.header("Análises Gerais")
-                create_summary_charts(df)
+            try:
+                date_obj = datetime.strptime(match.group(1), '%d/%m/%Y')
+                description = match.group(4).strip()
                 
-                # Distribuição de tipos e bancos
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.subheader("Distribuição por Tipo")
-                    type_dist = df['tipo'].value_counts()
-                    st.bar_chart(type_dist)
+                # O valor correto pode estar no grupo 6 ou 7
+                valor_str = match.group(6) if match.group(6) else match.group(5)
+                valor_dc = match.group(7).upper() if match.group(7) else 'D'
                 
-                with col2:
-                    st.subheader("Distribuição por Banco")
-                    if 'banco_detectado' in df.columns:
-                        banco_dist = df['banco_detectado'].value_counts()
-                        st.bar_chart(banco_dist)
-                    else:
-                        st.info("Informação de banco não disponível")
+                value = parse_monetary_string(valor_str)
+                if value is None:
+                    continue
+                
+                # Aplicar sinal correto
+                if valor_dc == 'D':
+                    value = -abs(value)
+                else:
+                    value = abs(value)
+                
+                # Saldo se presente
+                balance = None
+                if match.group(8):
+                    balance = parse_monetary_string(match.group(8))
+                    if balance:
+                        balance = abs(balance)
+                
+                transaction = Transaction(
+                    date=date_obj,
+                    description=description,
+                    value=value,
+                    balance=balance,
+                    source_bank='BB',
+                    confidence_score=0.95
+                )
+                
+                transactions.append(transaction)
+                
+            except Exception as e:
+                continue
+        
+        return transactions
+    
+    def parse_bradesco(self, lines: List[str]) -> List[Transaction]:
+        """Parser Bradesco - colunas e datas não repetidas"""
+        transactions = []
+        current_date = None
+        
+        for line in lines:
+            line_clean = line.strip()
             
-            with tab2:
-                create_confidence_analysis(df)
-                
-                # Análise de confiança por banco
-                if 'banco_detectado' in df.columns and PLOTLY_AVAILABLE:
-                    st.subheader("📊 Confiança por Banco")
-                    confidence_by_bank = df.groupby('banco_detectado')['confianca'].agg(['mean', 'count']).reset_index()
-                    confidence_by_bank.columns = ['banco', 'confianca_media', 'quantidade']
+            if len(line_clean) < 10:
+                continue
+            
+            # Ignora linhas de saldo
+            if re.search(r'SALDO\s+(ANTERIOR|ATUAL|FINAL|TOTAL)', line_clean, re.IGNORECASE):
+                continue
+            
+            # Tenta extrair data no início da linha
+            date_match = re.match(r'(\d{2}/\d{2}/\d{4})', line_clean)
+            if date_match:
+                try:
+                    current_date = datetime.strptime(date_match.group(1), '%d/%m/%Y')
+                except:
+                    continue
+            
+            if not current_date:
+                continue
+            
+            # Padrão Bradesco: [DATA] LANÇAMENTO DCTO. [CRÉDITO] [DÉBITO] SALDO
+            bradesco_pattern = re.compile(
+                r'(?:\d{2}/\d{2}/\d{4}\s+)?'    # data opcional
+                r'(.+?)\s+'                      # descrição
+                r'(\d+)\s+'                      # documento
+                r'([\d.,]+|-[\d.,]+|\s*)\s*'     # crédito
+                r'([\d.,]+|-[\d.,]+|\s*)\s*'     # débito
+                r'([\d.,]+|-[\d.,]+)',           # saldo
+                re.IGNORECASE
+            )
+            
+            match = bradesco_pattern.search(line_clean)
+            if not match:
+                continue
+            
+            description = match.group(1).strip()
+            credit_str = match.group(3).strip() if match.group(3) else ""
+            debit_str = match.group(4).strip() if match.group(4) else ""
+            saldo_str = match.group(5).strip()
+            
+            # Ignora se descrição contém "SALDO"
+            if 'SALDO' in description.upper():
+                continue
+            
+            value = None
+            if credit_str and credit_str not in ['', '-'] and not credit_str.startswith('-'):
+                value = parse_monetary_string(credit_str)
+                if value:
+                    value = abs(value)
+            elif debit_str and debit_str not in ['', '-']:
+                value = parse_monetary_string(debit_str)
+                if value:
+                    value = -abs(value)
+            
+            if value is None or abs(value) < 0.01:
+                continue
+            
+            saldo = parse_monetary_string(saldo_str)
+            
+            transaction = Transaction(
+                date=current_date,
+                description=description,
+                value=value,
+                balance=abs(saldo) if saldo else None,
+                source_bank='BRADESCO',
+                confidence_score=0.85
+            )
+            
+            transactions.append(transaction)
+        
+        return transactions
+    
+    def parse_inter(self, lines: List[str]) -> List[Transaction]:
+        """Parser Banco Inter - formato com datas por extenso"""
+        transactions = []
+        current_date = None
+        
+        for line in lines:
+            line_clean = line.strip()
+            
+            if len(line_clean) < 15:
+                continue
+            
+            # Detecta data por extenso
+            date_pattern = r'(\d{1,2})\s+de\s+(janeiro|fevereiro|março|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s+de\s+(\d{4})'
+            date_match = re.search(date_pattern, line_clean, re.IGNORECASE)
+            
+            if date_match:
+                try:
+                    day = int(date_match.group(1))
+                    month_name = date_match.group(2).lower()
+                    year = int(date_match.group(3))
                     
-                    fig3 = px.bar(
-                        confidence_by_bank,
-                        x='banco',
-                        y='confianca_media',
-                        title='Confiança Média por Banco Detectado',
-                        labels={'confianca_media': 'Confiança Média', 'banco': 'Banco'},
-                        text='quantidade'
-                    )
-                    fig3.update_traces(texttemplate='%{text} tx', textposition='outside')
-                    st.plotly_chart(fig3, use_container_width=True)
+                    months = {
+                        'janeiro': 1, 'fevereiro': 2, 'março': 3, 'abril': 4,
+                        'maio': 5, 'junho': 6, 'julho': 7, 'agosto': 8,
+                        'setembro': 9, 'outubro': 10, 'novembro': 11, 'dezembro': 12
+                    }
+                    
+                    month = months.get(month_name, 1)
+                    current_date = datetime(year, month, day)
+                except:
+                    continue
             
-            with tab3:
-                show_classification_review(df)
+            if not current_date:
+                continue
             
-            with tab4:
-                st.header("📋 Dados Extraídos")
+            # Padrão Inter: descrição -R$ valor R$ saldo
+            inter_pattern = re.compile(
+                r'([^-+R$]+?)\s*'              # descrição
+                r'(-?R\$\s*[\d.,]+)\s+'       # valor
+                r'R\$\s*([\d.,]+|-[\d.,]+)',  # saldo
+                re.IGNORECASE
+            )
+            
+            match = inter_pattern.search(line_clean)
+            if not match:
+                continue
+            
+            description = match.group(1).strip()
+            value_str = match.group(2)
+            saldo_str = match.group(3)
+            
+            # Filtra descrições de data ou ruído
+            if re.search(r'\d+\s+de\s+\w+|saldo\s+do\s+dia', description, re.IGNORECASE):
+                continue
+            
+            value = parse_monetary_string(value_str)
+            if value is None or abs(value) < 0.01:
+                continue
+            
+            saldo = parse_monetary_string(saldo_str)
+            
+            transaction = Transaction(
+                date=current_date,
+                description=description,
+                value=value,
+                balance=abs(saldo) if saldo else None,
+                source_bank='INTER',
+                confidence_score=0.88
+            )
+            
+            transactions.append(transaction)
+        
+        return transactions
+    
+    def parse_caixa(self, lines: List[str]) -> List[Transaction]:
+        """Parser Caixa - formato com D/C explícito"""
+        transactions = []
+        
+        for line in lines:
+            line_clean = line.strip()
+            
+            if len(line_clean) < 15:
+                continue
+            
+            # Padrão Caixa: DATA Nr.Doc HISTÓRICO VALOR D/C SALDO D/C
+            caixa_pattern = re.compile(
+                r'(\d{2}/\d{2}/\d{4})\s+'      # data
+                r'(\d+)\s+'                    # documento
+                r'(.+?)\s+'                    # histórico
+                r'([\d.,]+)\s*([CD])\s+'       # valor + D/C
+                r'([\d.,]+)\s*([CD])',         # saldo + D/C
+                re.IGNORECASE
+            )
+            
+            match = caixa_pattern.search(line_clean)
+            if not match:
+                continue
+            
+            try:
+                date_obj = datetime.strptime(match.group(1), '%d/%m/%Y')
+                description = match.group(3).strip()
+                valor_str = match.group(4)
+                valor_dc = match.group(5).upper()
+                saldo_str = match.group(6)
                 
-                # Filtros expandidos
-                col1, col2, col3, col4 = st.columns(4)
+                value = parse_monetary_string(valor_str)
+                if value is None:
+                    continue
                 
-                with col1:
-                    tipos_sel = st.multiselect(
-                        "Filtrar por tipo:",
-                        options=df['tipo'].unique().tolist(),
-                        default=df['tipo'].unique().tolist()
-                    )
+                # Aplicar sinal baseado em D/C
+                if valor_dc == 'D':
+                    value = -abs(value)
+                else:
+                    value = abs(value)
                 
-                with col2:
-                    categorias_sel = st.multiselect(
-                        "Filtrar por categoria:",
-                        options=df['categoria'].unique().tolist(),
-                        default=df['categoria'].unique().tolist()
-                    )
+                saldo = parse_monetary_string(saldo_str)
                 
-                with col3:
-                    min_confidence = st.slider(
-                        "Confiança mínima:",
-                        min_value=0.0,
-                        max_value=1.0,
-                        value=0.0,
-                        step=0.1
-                    )
+                transaction = Transaction(
+                    date=date_obj,
+                    description=description,
+                    value=value,
+                    balance=abs(saldo) if saldo else None,
+                    source_bank='CAIXA',
+                    confidence_score=0.92
+                )
                 
-                with col4:
-                    if 'banco_detectado' in df.columns:
-                        bancos_sel = st.multiselect(
-                            "Filtrar por banco:",
-                            options=df['banco_detectado'].unique().tolist(),
-                            default=df['banco_detectado'].unique().tolist()
-                        )
-                    else:
-                        bancos_sel = []
+                transactions.append(transaction)
                 
-                # Filtro de data
-                if not df.empty:
-                    date_range = st.date_input(
-                        "Período:",
-                        value=(df['data'].min().date(), df['data'].max().date()),
-                        min_value=df['data'].min().date(),
-                        max_value=df['data'].max().date()
-                    )
-                
-                # Aplicar filtros
-                filtered_df = df[
-                    (df['tipo'].isin(tipos_sel)) &
-                    (df['categoria'].isin(categorias_sel)) &
-                    (df['confianca'] >= min_confidence)
-                ]
-                
-                if bancos_sel and 'banco_detectado' in df.columns:
-                    filtered_df = filtered_df[filtered_df['banco_detectado'].isin(bancos_sel)]
-                
-                if len(date_range) == 2:
-                    filtered_df = filtered_df[
-                        (filtered_df['data'] >= pd.to_datetime(date_range[0])) &
-                        (filtered_df['data'] <= pd.to_datetime(date_range[1]))
-                    ]
-                
-                # Exibir dados filtrados
-                st.dataframe(filtered_df, use_container_width=True)
-                
-                # Downloads
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    csv_filtered = filtered_df.to_csv(index=False, encoding='utf-8-sig')
-                    st.download_button(
-                        "📥 Baixar Dados Filtrados (CSV)",
-                        csv_filtered,
-                        file_name="extratos_filtrados.csv",
-                        mime="text/csv"
-                    )
-                
-                with col2:
-                    csv_all = df.to_csv(index=False, encoding='utf-8-sig')
-                    st.download_button(
-                        "📥 Baixar Todos os Dados (CSV)",
-                        csv_all,
-                        file_name="extratos_completo.csv",
-                        mime="text/csv"
-                    )
+            except Exception:
+                continue
+        
+        return transactions
+    
+    def parse_itau(self, lines: List[str]) -> List[Transaction]:
+        """Parser Itaú - formato específico com datas dd/mmm"""
+        transactions = []
+        current_date = None
+        current_year = 2024  # Inferir do contexto
+        
+        for line in lines:
+            line_clean = line.strip()
+            
+            if len(line_clean) < 10:
+                continue
+            
+            # Ignora linhas de saldo
+            if re.search(r'SALDO\s+(ANTERIOR|TOTAL|DISPONÍVEL)', line_clean, re.IGNORECASE):
+                continue
+            
+            # Detecta data dd / mmm
+            date_match = re.search(r'(\d{1,2})\s*/\s*(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)', line_clean, re.IGNORECASE)
+            if date_match:
+                try:
+                    day = int(date_match.group(1))
+                    month_abbr = date_match.group(2).lower()
+                    
+                    months = {
+                        'jan': 1, 'fev': 2, 'mar': 3, 'abr': 4, 'mai': 5, 'jun': 6,
+                        'jul': 7, 'ago': 8, 'set': 9, 'out': 10, 'nov': 11, 'dez': 12
+                    }
+                    
+                    month = months.get(month_abbr, 1)
+                    current_date = datetime(current_year, month, day)
+                except:
+                    continue
+            
+            if not current_date:
+                continue
+            
+            # Extrai valor (negativo típico no Itaú)
+            value_matches = re.findall(r'-?([\d.,]+)', line_clean)
+            if not value_matches:
+                continue
+            
+            # Pega o maior valor como transação
+            values = [parse_monetary_string(v) for v in value_matches]
+            values = [v for v in values if v and abs(v) > 0.01]
+            
+            if not values:
+                continue
+            
+            value = max(values, key=abs)
+            
+            # Classificar baseado em palavras-chave
+            debit_keywords = ['BOLETO PAGO', 'PIX ENVIADO', 'PAGTO CDC', 'FIN VEIC', 'SISPAG TRIB']
+            credit_keywords = ['PIX TRANSF', 'TED.*RECEBIDA', 'MOV TIT COB DISP', 'INT RESGATE']
+            
+            is_debit = any(kw in line_clean.upper() for kw in debit_keywords)
+            is_credit = any(re.search(kw, line_clean.upper()) for kw in credit_keywords)
+            
+            if is_debit:
+                value = -abs(value)
+            elif is_credit:
+                value = abs(value)
+            elif line_clean.startswith('-'):
+                value = -abs(value)
+            
+            # Limpar descrição
+            description = re.sub(r'\d{1,2}\s*/\s*\w{3}|\d{2}/\d{2}/\d{4}', '', line_clean).strip()
+            description = re.sub(r'-?[\d.,]+', '', description).strip()
+            description = re.sub(r'\s+', ' ', description)[:100]
+            
+            if len(description) < 3:
+                description = "Transação Itaú"
+            
+            transaction = Transaction(
+                date=current_date,
+                description=description,
+                value=value,
+                balance=None,
+                source_bank='ITAU',
+                confidence_score=0.80
+            )
+            
+            transactions.append(transaction)
+        
+        return transactions
 
-    else:
-        st.info("👆 Faça upload de arquivos PDF para começar o processamento")
-        
-        # Exemplo de bancos suportados
-        with st.expander("🏦 Bancos e Formatos Suportados"):
-            st.markdown("""
-            ### Bancos com Parsers Específicos:
-            
-            **🔹 Banco do Brasil** - Formato estruturado com D/C
-            - Detecta automaticamente transferências, PIX, boletos
-            - Alta precisão na classificação débito/crédito
-            
-            **🔹 Bradesco** - Colunas Crédito/Débito separadas
-            - Reconhece investimentos, cartão de crédito
-            - Formatação em colunas estruturadas
-            
-            **🔹 Banco Inter** - Valores com sinais explícitos
-            - PIX enviados/recebidos bem definidos
-            - Datas em formato extenso português
-            
-            **🔹 Caixa Econômica** - Histórico + valor D/C
-            - TED, boletos, aplicações automáticas
-            - Formato tabular clássico
-            
-            **🔹 XP Investimentos** - Operações de investimento
-            - Resgates, aportes, TED
-            - Valores negativos com hífen
-            
-            **🔹 Itaú** - Múltiplos formatos
-            - PIX, boletos, transferências
-            - Detecção por palavras-chave
-            
-            **🔹 Santander** - TED e aplicações
-            - Conta Max, PIX empresarial
-            - Investimentos automáticos
-            
-            **🔹 Sicoob** - Cooperativas de crédito
-            - PIX, TED, operações cooperativistas
-            - Formato com D/C ao final
-            
-            **🔹 Nubank** - Conta digital
-            - Formato minimalista
-            - Transações digitais
-            
-            ### Funcionalidades Avançadas:
-            - ✅ **Detecção automática** do banco
-            - ✅ **Classificação inteligente** débito/crédito  
-            - ✅ **Pontuação de confiança** por transação
-            - ✅ **Categorização automática** (alimentação, transporte, etc.)
-            - ✅ **Interface de revisão** para baixa confiança
-            - ✅ **Suporte a múltiplos bancos** simultaneamente
-            """)
-
-if __name__ == "__main__":
-    main(), full_line, re.IGNORECASE)
-        if saldo_pattern and not dc_pattern:  # Se não achou padrão duplo, pode ser valor único
-            valor_dc = saldo_pattern.group(1)
-            sinal_dc = saldo_pattern.group(2).upper()
-            
-            # Verifica se é o valor da transação (não o saldo)
-            parsed_saldo = parse_monetary_string(valor_dc)
-            if parsed_saldo and abs(parsed_saldo - abs(value_info['value'])) < 0.01:
-                if sinal_dc == 'D':
-                    debit_score += 0.45
-                    confidence_score += 0.35
-                elif sinal_dc == 'C':
-                    credit_score += 0.45
-                    confidence_score += 0.35
-        
-        # 3. Palavras-chave específicas de débito do BB (alta confiança)
-        bb_debit_keywords = [
-            'pagamento de boleto', 'pagamento conta', 'pagto conta', 'transferência enviada',
-            'pix - enviado', 'pix - agendamento', 'pix enviado', 'folha de pagamento',
-            'impostos', 'tarifa', 'cheque compensado', 'cheque pago', 'transferência agendada'
-        ]
-        
-        for keyword in bb_debit_keywords:
-            if keyword in line_lower:
-                debit_score += 0.4
-                confidence_score += 0.3
-                break
-        
-        # 4. Palavras-chave específicas de crédito do BB (alta confiança)
-        bb_credit_keywords = [
-            'depósito online', 'bb rende fácil', 'pix - rejeitado', 'pix rejeitado',
-            'transferência recebida', 'pix recebido', 'saldo anterior'
-        ]
-        
-        for keyword in bb_credit_keywords:
-            if keyword in line_lower:
-                credit_score += 0.4
-                confidence_score += 0.3
-                break
-        
-        # 5. Análise contextual adicional
-        # PIX enviado vs recebido
-        if 'pix' in line_lower:
-            if any(word in line_lower for word in ['enviado', 'agendamento', 'para']):
-                debit_score += 0.3
-            elif any(word in line_lower for word in ['recebido', 'de
-
-    def identify_transaction_and_balance(self, value_matches: List[Dict], line: str) -> Tuple[Dict, Dict]:
-        """
-        Identifica qual valor é a transação e qual é o saldo.
-        Retorna (transaction_value_info, balance_value_info)
-        """
-        if len(value_matches) == 1:
-            return value_matches[0], None
-        
-        line_len = len(line)
-        
-        # Ordena por posição
-        sorted_matches = sorted(value_matches, key=lambda x: x['start'])
-        
-        # Heurísticas para identificar saldo
-        balance_candidate = None
-        
-        for i, match in enumerate(sorted_matches):
-            # Saldo geralmente aparece no final da linha
-            if match['start'] > line_len * 0.7:
-                # Verifica se contexto indica saldo
-                context = match['context_after']
-                if any(word in context for word in ['saldo', 'sld']):
-                    balance_candidate = match
-                    break
-                # Se é o último valor e está no final, provavelmente é saldo
-                elif i == len(sorted_matches) - 1:
-                    balance_candidate = match
-                    break
-        
-        # Remove saldo da lista de candidatos a transação
-        transaction_candidates = [m for m in sorted_matches if m != balance_candidate]
-        
-        if transaction_candidates:
-            # Escolhe o primeiro candidato restante como transação
-            transaction_value = transaction_candidates[0]
-        else:
-            # Se não há candidatos, usa o primeiro valor como transação
-            transaction_value = sorted_matches[0]
-            balance_candidate = None
-        
-        return transaction_value, balance_candidate
-
-    def clean_description(self, line: str, date_match: re.Match, value_matches: List[Dict]) -> str:
-        """Limpa a descrição removendo datas, valores e ruído"""
-        # Cria máscara para marcar caracteres a remover
-        mask = [False] * len(line)
-        
-        # Marca posição da data
-        if date_match:
-            for i in range(date_match.start(), date_match.end()):
-                if i < len(mask):
-                    mask[i] = True
-        
-        # Marca posições dos valores
-        for match in value_matches:
-            for i in range(match['start'], min(match['end'], len(mask))):
-                mask[i] = True
-        
-        # Constrói descrição sem caracteres marcados
-        description = ''.join(char if not mask[i] else ' ' for i, char in enumerate(line))
-        
-        # Limpeza adicional
-        description = re.sub(r'[Rr]\$|\(|\)|[CD]\b|\bD\b|\bC\b', ' ', description)
-        description = re.sub(r'[:\-•*=]+', ' ', description)
-        description = re.sub(r'\s+', ' ', description).strip()
-        
-        # Remove palavras de ruído remanescentes
-        noise_words = ['saldo', 'total', 'subtotal', 'resumo', 'extrato', 'anterior', 'atual', 'final']
-        for word in noise_words:
-            description = re.sub(rf'\b{word}\b', ' ', description, flags=re.IGNORECASE)
-        
-        description = re.sub(r'\s+', ' ', description).strip()
-        
-        if len(description) < 3:
-            description = "Transação não identificada"
-        
-        return description
-
-    def classify_transaction_type(self, description: str, value: float) -> str:
-        """Classifica o tipo de transação baseado na descrição e valor"""
-        desc_lower = description.lower()
-        
-        if value < 0:  # Débitos
-            if any(word in desc_lower for word in ['pix', 'ted', 'doc', 'transferência', 'transf']):
-                if any(word in desc_lower for word in ['enviado', 'enviada', 'para', 'pagto']):
-                    return 'TRANSFERÊNCIA_SAÍDA'
-            
-            if any(word in desc_lower for word in ['saque', 'atm', 'caixa eletrônico', 'retirada']):
-                return 'SAQUE'
-            
-            if any(word in desc_lower for word in ['compra', 'débito automático', 'cartão']):
-                return 'COMPRA_DÉBITO'
-            
-            if any(word in desc_lower for word in ['tarifa', 'taxa', 'juros', 'iof', 'anuidade']):
-                return 'TARIFA'
-            
-            if any(word in desc_lower for word in ['pagamento', 'pagto', 'boleto']):
-                return 'PAGAMENTO'
-            
-            return 'DÉBITO'
-        
-        else:  # Créditos
-            if any(word in desc_lower for word in ['pix', 'ted', 'doc', 'transferência', 'transf']):
-                if any(word in desc_lower for word in ['recebido', 'recebida', 'de']):
-                    return 'TRANSFERÊNCIA_ENTRADA'
-            
-            if any(word in desc_lower for word in ['salário', 'salario', 'remuneração']):
-                return 'SALÁRIO'
-            
-            if any(word in desc_lower for word in ['depósito', 'deposito']):
-                return 'DEPÓSITO'
-            
-            if any(word in desc_lower for word in ['rendimento', 'juros', 'remuneração']):
-                return 'RENDIMENTO'
-            
-            if any(word in desc_lower for word in ['estorno', 'reembolso', 'ressarcimento']):
-                return 'ESTORNO'
-            
-            return 'CRÉDITO'
-
-    def categorize_transaction(self, description: str) -> str:
-        """Categoriza a transação baseado na descrição"""
-        desc_lower = description.lower()
-        
-        # Alimentação
-        food_keywords = ['restaurante', 'lanche', 'mercado', 'supermercado', 'padaria', 
-                        'ifood', 'uber eats', 'delivery', 'açougue', 'pizzaria']
-        if any(word in desc_lower for word in food_keywords):
-            return 'ALIMENTAÇÃO'
-        
-        # Transporte
-        transport_keywords = ['uber', '99', 'combustível', 'posto', 'gasolina', 'diesel',
-                             'estacionamento', 'pedágio', 'ônibus', 'metrô', 'taxi']
-        if any(word in desc_lower for word in transport_keywords):
-            return 'TRANSPORTE'
-        
-        # Casa
-        home_keywords = ['energia', 'luz', 'água', 'gas', 'telefone', 'internet', 
-                        'condomínio', 'aluguel', 'financiamento', 'iptu']
-        if any(word in desc_lower for word in home_keywords):
-            return 'CASA'
-        
-        # Saúde
-        health_keywords = ['farmácia', 'hospital', 'médico', 'dentista', 'clínica',
-                          'laboratório', 'exame', 'consulta', 'plano de saúde']
-        if any(word in desc_lower for word in health_keywords):
-            return 'SAÚDE'
-        
-        # Lazer
-        leisure_keywords = ['netflix', 'spotify', 'cinema', 'teatro', 'show', 'bar',
-                           'festa', 'viagem', 'hotel', 'turismo']
-        if any(word in desc_lower for word in leisure_keywords):
-            return 'LAZER'
-        
-        # Compras
-        shopping_keywords = ['americanas', 'mercado livre', 'amazon', 'magazine', 
-                            'shopping', 'loja', 'compra']
-        if any(word in desc_lower for word in shopping_keywords):
-            return 'COMPRAS'
-        
-        # Educação
-        education_keywords = ['escola', 'universidade', 'curso', 'faculdade', 'colégio']
-        if any(word in desc_lower for word in education_keywords):
-            return 'EDUCAÇÃO'
-        
-        return 'OUTROS'
-
-    def parse_transaction_line(self, line: str) -> Optional[Transaction]:
-        """Parse principal de uma linha para extrair transação"""
-        if not line or len(line.strip()) < 6:
-            return None
-        
-        if self.is_noise_line(line):
-            return None
-        
-        # 1. Encontra data
-        date_match = self.find_date(line)
-        if not date_match:
-            return None
-        
-        date_obj = self.parse_date_from_match(date_match)
-        if not date_obj:
-            return None
-        
-        # 2. Extrai valores monetários
-        value_matches = self.extract_value_matches(line)
-        if not value_matches:
-            return None
-        
-        # 3. Identifica transação e saldo
-        transaction_value_info, balance_value_info = self.identify_transaction_and_balance(value_matches, line)
-        
-        # 4. Classifica débito/crédito
-        is_debit, confidence = self.classify_debit_credit_improved(line, transaction_value_info)
-        
-        # 5. Ajusta o valor conforme classificação
-        transaction_value = transaction_value_info['value']
-        if is_debit and transaction_value > 0:
-            transaction_value = -abs(transaction_value)
-        elif not is_debit and transaction_value < 0:
-            transaction_value = abs(transaction_value)
-        
-        # 6. Extrai saldo se identificado
-        balance_value = None
-        if balance_value_info:
-            balance_value = abs(balance_value_info['value'])  # Saldo sempre positivo
-        
-        # 7. Limpa descrição
-        description = self.clean_description(line, date_match, value_matches)
-        
-        # 8. Classifica tipo e categoria
-        transaction_type = self.classify_transaction_type(description, transaction_value)
-        category = self.categorize_transaction(description)
-        
-        return Transaction(
-            date=date_obj,
-            description=description,
-            value=transaction_value,
-            balance=balance_value,
-            transaction_type=transaction_type,
-            category=category,
-            confidence_score=confidence
-        )
-
-# ============================================================
-# 5) Extrator principal
-# ============================================================
 class BankStatementExtractor:
-    def __init__(self, matcher: Optional[EnhancedBankMatcher] = None):
-        self.matcher = matcher or EnhancedBankMatcher()
-
+    def __init__(self):
+        self.matcher = ProfessionalBankMatcher()
+        self.parser = BankParser()
+    
     def extract_from_pdf_bytes(self, pdf_bytes: bytes, filename: str) -> pd.DataFrame:
-        """Extrai transações de PDF em bytes"""
+        """Extrai transações com algoritmo robusto"""
         try:
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 all_lines = []
@@ -1395,71 +564,69 @@ class BankStatementExtractor:
                     if text:
                         all_lines.extend(text.splitlines())
             
-            transactions = self._process_lines(all_lines)
+            # Filtra ruído
+            clean_lines = [line for line in all_lines if not self.matcher.is_noise_line(line)]
+            
+            if not clean_lines:
+                return pd.DataFrame()
+            
+            # Detecta banco
+            bank_format = self.matcher.detect_bank_format(clean_lines)
+            
+            # Parse específico por banco
+            transactions = []
+            
+            if bank_format == 'BB':
+                transactions = self.parser.parse_bb(clean_lines)
+            elif bank_format == 'BRADESCO':
+                transactions = self.parser.parse_bradesco(clean_lines)
+            elif bank_format == 'INTER':
+                transactions = self.parser.parse_inter(clean_lines)
+            elif bank_format == 'CAIXA':
+                transactions = self.parser.parse_caixa(clean_lines)
+            elif bank_format == 'ITAU':
+                transactions = self.parser.parse_itau(clean_lines)
+            # Adicionar outros bancos...
+            
+            if not transactions:
+                return pd.DataFrame()
+            
+            # Converter para DataFrame
             df = self._transactions_to_dataframe(transactions)
             
             if not df.empty:
                 df['arquivo'] = filename
+                df['banco_detectado'] = bank_format
             
             return df
-        
-        except Exception as e:
-            logger.exception(f"Erro ao processar PDF {filename}: {e}")
-            return pd.DataFrame()
-
-    def _process_lines(self, lines: List[str]) -> List[Transaction]:
-        """Processa linhas extraindo transações válidas"""
-        transactions = []
-        
-        for line in lines:
-            if not line or len(line.strip()) < 6:
-                continue
             
-            transaction = self.matcher.parse_transaction_line(line)
-            if transaction and self._is_valid_transaction(transaction):
-                transactions.append(transaction)
-        
-        return transactions
-
-    def _is_valid_transaction(self, transaction: Transaction) -> bool:
-        """Valida se a transação é legítima"""
-        if not transaction:
-            return False
-        
-        # Valor deve existir e ter magnitude mínima
-        if transaction.value is None or abs(transaction.value) < 0.01:
-            return False
-        
-        # Descrição deve ser significativa
-        if not transaction.description or len(transaction.description.strip()) < 3:
-            return False
-        
-        # Confiança mínima na classificação
-        if transaction.confidence_score < 0.1:
-            return False
-        
-        return True
-
+        except Exception as e:
+            logger.exception(f"Erro ao processar {filename}: {e}")
+            return pd.DataFrame()
+    
     def _transactions_to_dataframe(self, transactions: List[Transaction]) -> pd.DataFrame:
-        """Converte lista de transações para DataFrame"""
+        """Converte transações para DataFrame"""
         if not transactions:
             return pd.DataFrame()
         
         data = []
         for t in transactions:
+            # Classificar tipo e categoria
+            tipo = self._classify_transaction_type(t.description, t.value)
+            categoria = self._categorize_transaction(t.description)
+            
             data.append({
                 'data': t.date,
                 'descricao': t.description,
                 'valor': t.value,
                 'saldo': t.balance,
-                'tipo': t.transaction_type,
-                'categoria': t.category,
-                'confianca': t.confidence_score
+                'tipo': tipo,
+                'categoria': categoria,
+                'confianca': t.confidence_score,
+                'banco_detectado': t.source_bank
             })
         
         df = pd.DataFrame(data)
-        
-        # Normalização e ordenação
         df['data'] = pd.to_datetime(df['data'])
         df = df.sort_values('data').reset_index(drop=True)
         
@@ -1473,12 +640,47 @@ class BankStatementExtractor:
         df['eh_credito'] = df['valor'] > 0
         
         return df
+    
+    def _classify_transaction_type(self, description: str, value: float) -> str:
+        """Classifica tipo de transação"""
+        desc = description.lower()
+        
+        if value < 0:
+            if any(word in desc for word in ['pix', 'ted', 'doc', 'transferência']):
+                return 'TRANSFERÊNCIA_SAÍDA'
+            if any(word in desc for word in ['saque', 'atm', 'retirada']):
+                return 'SAQUE'
+            if any(word in desc for word in ['boleto', 'pagamento']):
+                return 'PAGAMENTO'
+            if any(word in desc for word in ['tarifa', 'taxa', 'juros']):
+                return 'TARIFA'
+            return 'DÉBITO'
+        else:
+            if any(word in desc for word in ['pix', 'ted', 'transferência']):
+                return 'TRANSFERÊNCIA_ENTRADA'
+            if any(word in desc for word in ['salário', 'remuneração']):
+                return 'SALÁRIO'
+            if any(word in desc for word in ['depósito']):
+                return 'DEPÓSITO'
+            return 'CRÉDITO'
+    
+    def _categorize_transaction(self, description: str) -> str:
+        """Categoriza transação"""
+        desc = description.lower()
+        
+        if any(word in desc for word in ['mercado', 'supermercado', 'restaurante', 'lanche']):
+            return 'ALIMENTAÇÃO'
+        if any(word in desc for word in ['combustível', 'posto', 'uber', 'taxi']):
+            return 'TRANSPORTE'
+        if any(word in desc for word in ['energia', 'água', 'telefone', 'internet']):
+            return 'CASA'
+        if any(word in desc for word in ['farmácia', 'hospital', 'médico']):
+            return 'SAÚDE'
+        
+        return 'OUTROS'
 
-# ============================================================
-# 6) Processamento de múltiplos PDFs
-# ============================================================
 def process_multiple_pdfs(uploaded_files):
-    """Processa múltiplos arquivos PDF"""
+    """Processa múltiplos PDFs"""
     extractor = BankStatementExtractor()
     all_dfs = []
     
@@ -1496,8 +698,9 @@ def process_multiple_pdfs(uploaded_files):
                 st.warning(f"⚠️ {uploaded_file.name}: nenhuma transação identificada")
             else:
                 all_dfs.append(df)
-                avg_confidence = df['confianca'].mean()
-                st.success(f"✅ {uploaded_file.name}: {len(df)} transações (confiança média: {avg_confidence:.2f})")
+                banco = df['banco_detectado'].iloc[0] if not df.empty else 'N/A'
+                confianca = df['confianca'].mean()
+                st.success(f"✅ {uploaded_file.name}: {len(df)} transações | Banco: **{banco}** | Confiança: {confianca:.2f}")
         
         except Exception as e:
             st.error(f"❌ Erro ao processar {uploaded_file.name}: {e}")
@@ -1513,340 +716,24 @@ def process_multiple_pdfs(uploaded_files):
     
     return pd.DataFrame()
 
-# ============================================================
-# 7) Análises e gráficos
-# ============================================================
-def create_summary_charts(df):
-    """Cria gráficos de resumo"""
-    if df.empty or not PLOTLY_AVAILABLE:
-        if not PLOTLY_AVAILABLE:
-            st.warning("Plotly não disponível — gráficos desabilitados")
-        return
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Fluxo de caixa mensal
-        monthly = df.groupby('mes_ano')['valor'].sum().reset_index()
-        monthly['mes_ano_dt'] = pd.to_datetime(monthly['mes_ano'] + '-01')
-        monthly = monthly.sort_values('mes_ano_dt')
-        
-        fig1 = px.line(
-            monthly, 
-            x='mes_ano_dt', 
-            y='valor',
-            title='Fluxo de Caixa Mensal',
-            labels={'valor': 'Valor (R$)', 'mes_ano_dt': 'Mês'}
-        )
-        fig1.add_hline(y=0, line_dash='dash', line_color='red', annotation_text="Zero")
-        fig1.update_layout(xaxis_title="Período", yaxis_title="Valor (R$)")
-        st.plotly_chart(fig1, use_container_width=True)
-    
-    with col2:
-        # Gastos por categoria (apenas débitos)
-        debits = df[df['valor'] < 0].copy()
-        if not debits.empty:
-            category_spending = debits.groupby('categoria')['valor'].sum().abs().reset_index()
-            category_spending = category_spending.sort_values('valor', ascending=False)
-            
-            fig2 = px.bar(
-                category_spending,
-                x='categoria',
-                y='valor',
-                title='Gastos por Categoria',
-                labels={'valor': 'Valor (R$)', 'categoria': 'Categoria'}
-            )
-            fig2.update_xaxes(tickangle=45)
-            st.plotly_chart(fig2, use_container_width=True)
-
-def create_confidence_analysis(df):
-    """Análise de confiança das classificações"""
-    if df.empty:
-        return
-    
-    st.subheader("📊 Análise de Confiança na Classificação")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        avg_confidence = df['confianca'].mean()
-        st.metric("Confiança Média", f"{avg_confidence:.2f}")
-    
-    with col2:
-        high_confidence = (df['confianca'] >= 0.7).sum()
-        st.metric("Alta Confiança (≥0.7)", f"{high_confidence} ({high_confidence/len(df)*100:.1f}%)")
-    
-    with col3:
-        low_confidence = (df['confianca'] < 0.3).sum()
-        st.metric("Baixa Confiança (<0.3)", f"{low_confidence} ({low_confidence/len(df)*100:.1f}%)")
-    
-    if PLOTLY_AVAILABLE:
-        # Histograma de confiança
-        fig = px.histogram(
-            df,
-            x='confianca',
-            bins=20,
-            title='Distribuição da Confiança na Classificação',
-            labels={'confianca': 'Confiança', 'count': 'Quantidade'}
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Confiança por tipo de transação
-        confidence_by_type = df.groupby('tipo')['confianca'].agg(['mean', 'count']).reset_index()
-        confidence_by_type.columns = ['tipo', 'confianca_media', 'quantidade']
-        
-        fig2 = px.bar(
-            confidence_by_type,
-            x='tipo',
-            y='confianca_media',
-            title='Confiança Média por Tipo de Transação',
-            labels={'confianca_media': 'Confiança Média', 'tipo': 'Tipo'}
-        )
-        fig2.update_xaxes(tickangle=45)
-        st.plotly_chart(fig2, use_container_width=True)
-
-def show_classification_review(df):
-    """Interface para revisão das classificações"""
-    if df.empty:
-        return
-    
-    st.subheader("🔍 Revisão de Classificações")
-    
-    # Filtros para revisão
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        confidence_threshold = st.slider(
-            "Mostrar transações com confiança menor que:",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.5,
-            step=0.1
-        )
-    
-    with col2:
-        show_type = st.selectbox(
-            "Filtrar por tipo:",
-            ['Todos'] + df['tipo'].unique().tolist()
-        )
-    
-    # Aplica filtros
-    filtered = df[df['confianca'] < confidence_threshold]
-    if show_type != 'Todos':
-        filtered = filtered[filtered['tipo'] == show_type]
-    
-    if not filtered.empty:
-        st.write(f"Encontradas {len(filtered)} transações para revisão:")
-        
-        # Mostra transações para revisão
-        review_cols = ['data', 'descricao', 'valor', 'tipo', 'categoria', 'confianca']
-        st.dataframe(
-            filtered[review_cols].sort_values('confianca'),
-            use_container_width=True
-        )
-    else:
-        st.info("Nenhuma transação encontrada com os critérios selecionados.")
-
-# ============================================================
-# 8) Interface Streamlit principal
-# ============================================================
 def main():
-    st.title("🏦 Extrator de Extratos Bancários - Versão Melhorada")
-    st.markdown("""
-    Esta versão aprimorada oferece:
-    - **Melhor detecção de débito/crédito** com múltiplas heurísticas
-    - **Pontuação de confiança** para cada classificação
-    - **Análise de padrões** bancários brasileiros
-    - **Interface de revisão** para classificações duvidosas
-    """)
+    st.title("🏦 Extrator de Extratos Bancários - Versão Profissional")
+    st.markdown("Algoritmo robusto para processamento de múltiplos formatos bancários com alta precisão.")
 
-    with st.sidebar:
-        st.header("📋 Instruções")
-        st.markdown("""
-        ### Como usar:
-        1. Faça upload de PDFs de extratos bancários
-        2. Aguarde o processamento automático
-        3. Revise as classificações na aba de análise
-        4. Baixe os dados processados
-        
-        ### Melhorias desta versão:
-        - ✅ Detecção aprimorada de sinais (-, +, parênteses)
-        - ✅ Reconhecimento de padrões D/C
-        - ✅ Análise contextual de palavras-chave
-        - ✅ Identificação de PIX, TED, DOC
-        - ✅ Pontuação de confiança
-        """)
-        
-        st.header("ℹ️ Informações")
-        st.info("""
-        **Confiança na classificação:**
-        - 0.7+ : Alta confiança
-        - 0.3-0.7 : Média confiança  
-        - <0.3 : Baixa confiança
-        """)
-
-    # Upload de arquivos
     uploaded_files = st.file_uploader(
         "Escolha arquivos PDF de extratos bancários",
         type="pdf",
         accept_multiple_files=True,
-        help="Selecione um ou mais arquivos PDF de extratos bancários"
+        help="Carregue extratos de BB, Bradesco, Inter, Caixa, Itaú, etc."
     )
 
     if uploaded_files:
         if st.button("🚀 Processar Extratos", type="primary"):
-            with st.spinner("Processando extratos..."):
+            with st.spinner("Processando com algoritmo profissional..."):
                 df = process_multiple_pdfs(uploaded_files)
             
             if df.empty:
-                st.error("❌ Nenhuma transação foi extraída. Verifique se os PDFs contêm extratos bancários válidos.")
+                st.error("❌ Nenhuma transação extraída. Verifique se os PDFs são extratos bancários válidos.")
                 return
 
-            # Métricas principais
-            st.success(f"✅ Processamento concluído — {len(df)} transações extraídas")
-            
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.metric("Total de Transações", len(df))
-            
-            with col2:
-                total_credits = df[df['valor'] > 0]['valor'].sum()
-                st.metric("Total Créditos", f"R$ {total_credits:,.2f}")
-            
-            with col3:
-                total_debits = df[df['valor'] < 0]['valor'].sum()
-                st.metric("Total Débitos", f"R$ {total_debits:,.2f}")
-            
-            with col4:
-                net_flow = df['valor'].sum()
-                st.metric("Fluxo Líquido", f"R$ {net_flow:,.2f}")
-            
-            # Abas de análise
-            tab1, tab2, tab3, tab4 = st.tabs(["📈 Resumo", "🔍 Análise de Confiança", "📝 Revisão", "📊 Dados"])
-            
-            with tab1:
-                st.header("Análises Gerais")
-                create_summary_charts(df)
-                
-                # Distribuição de tipos
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.subheader("Distribuição por Tipo")
-                    type_dist = df['tipo'].value_counts()
-                    st.bar_chart(type_dist)
-                
-                with col2:
-                    st.subheader("Distribuição por Categoria")
-                    cat_dist = df['categoria'].value_counts()
-                    st.bar_chart(cat_dist)
-            
-            with tab2:
-                create_confidence_analysis(df)
-            
-            with tab3:
-                show_classification_review(df)
-            
-            with tab4:
-                st.header("📋 Dados Extraídos")
-                
-                # Filtros
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    tipos_sel = st.multiselect(
-                        "Filtrar por tipo:",
-                        options=df['tipo'].unique().tolist(),
-                        default=df['tipo'].unique().tolist()
-                    )
-                
-                with col2:
-                    categorias_sel = st.multiselect(
-                        "Filtrar por categoria:",
-                        options=df['categoria'].unique().tolist(),
-                        default=df['categoria'].unique().tolist()
-                    )
-                
-                with col3:
-                    min_confidence = st.slider(
-                        "Confiança mínima:",
-                        min_value=0.0,
-                        max_value=1.0,
-                        value=0.0,
-                        step=0.1
-                    )
-                
-                # Filtro de data
-                if not df.empty:
-                    date_range = st.date_input(
-                        "Período:",
-                        value=(df['data'].min().date(), df['data'].max().date()),
-                        min_value=df['data'].min().date(),
-                        max_value=df['data'].max().date()
-                    )
-                
-                # Aplicar filtros
-                filtered_df = df[
-                    (df['tipo'].isin(tipos_sel)) &
-                    (df['categoria'].isin(categorias_sel)) &
-                    (df['confianca'] >= min_confidence)
-                ]
-                
-                if len(date_range) == 2:
-                    filtered_df = filtered_df[
-                        (filtered_df['data'] >= pd.to_datetime(date_range[0])) &
-                        (filtered_df['data'] <= pd.to_datetime(date_range[1]))
-                    ]
-                
-                # Exibir dados filtrados
-                st.dataframe(filtered_df, use_container_width=True)
-                
-                # Downloads
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    csv_filtered = filtered_df.to_csv(index=False, encoding='utf-8-sig')
-                    st.download_button(
-                        "📥 Baixar Dados Filtrados (CSV)",
-                        csv_filtered,
-                        file_name="extratos_filtrados.csv",
-                        mime="text/csv"
-                    )
-                
-                with col2:
-                    csv_all = df.to_csv(index=False, encoding='utf-8-sig')
-                    st.download_button(
-                        "📥 Baixar Todos os Dados (CSV)",
-                        csv_all,
-                        file_name="extratos_completo.csv",
-                        mime="text/csv"
-                    )
-
-    else:
-        st.info("👆 Faça upload de arquivos PDF para começar o processamento")
-        
-        # Exemplo de funcionamento
-        with st.expander("🎯 Exemplo de Melhorias Implementadas"):
-            st.markdown("""
-            ### Detecção Aprimorada de Débito/Crédito:
-            
-            **Antes:** 
-            ```
-            01/01/2024 PIX JOÃO SILVA 150,00 → Não classificado corretamente
-            ```
-            
-            **Agora:**
-            ```
-            01/01/2024 PIX ENVIADO JOÃO SILVA 150,00 D → DÉBITO (confiança: 0.8)
-            01/01/2024 PIX RECEBIDO MARIA SANTOS 200,00 C → CRÉDITO (confiança: 0.9)
-            ```
-            
-            ### Padrões Reconhecidos:
-            - 🔸 Formatação: `(150,00)`, `-150,00`, `150,00 D`
-            - 🔸 Contexto: "PIX enviado", "TED recebida", "saque ATM"
-            - 🔸 Sufixos: valores terminados em C/D
-            - 🔸 Palavras-chave: 200+ termos específicos do contexto bancário
-            """)
-
-if __name__ == "__main__":
-    main()
+            st
