@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import re
@@ -37,9 +38,9 @@ def parse_monetary_string(s: str) -> Optional[float]:
     s = re.sub(r"[Rr]\$|\s+", "", s)
     s = s.lstrip("+-")
     if "." in s and "," in s:
-        if s.rfind(",") > s.rfind("."):
+        if s.rfind(",") > s.rfind("."): # Brazilian format
             s = s.replace(".", "").replace(",", ".")
-        else:
+        else: # US format
             s = s.replace(",", "")
     elif "," in s:
         parts = s.split(",")
@@ -110,58 +111,88 @@ class ProfessionalBankMatcher:
             return 'SICOOB'
         if re.search(r'Nu\s+Financeira|Nu\s+Pagamentos|VL\s+REPRESENTACAO', content, re.IGNORECASE):
             return 'NUBANK'
+        if re.search(r'Nenhuma movimentação realizada', content, re.IGNORECASE):
+            return 'NUBANK_EMPTY'
         return 'GENERIC'
 
 class BankParser:
     def __init__(self):
-        self.current_date = None
+        pass
 
     def parse_bb(self, lines: List[str]) -> List[Transaction]:
         transactions = []
-        for line in lines:
-            if len(line.strip()) < 20:
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if len(line) < 10 or "SALDO ANTERIOR" in line.upper() or "S A L D O" in line.upper() or "Dt. balancete Dt. movimento" in line.upper():
+                i += 1
                 continue
-            bb_pattern = re.compile(
-                r'(\d{2}/\d{2}/\d{4})\s+'
-                r'(\d{4})\s+'
-                r'(\d{5})\s+'
-                r'(.+?)\s+'
-                r'([\d.,]+)\s+'
-                r'([\d.,]+)\s*([CD])\s*'
-                r'(?:([\d.,]+)\s*([CD]))?',
-                re.IGNORECASE
-            )
-            match = bb_pattern.search(line)
-            if not match:
+
+            if "BB RENDE FÁCIL" in line.upper():
+                i+=1
                 continue
-            try:
-                date_obj = datetime.strptime(match.group(1), '%d/%m/%Y')
-                description = match.group(4).strip()
-                valor_str = match.group(6) if match.group(6) else match.group(5)
-                valor_dc = match.group(7).upper() if match.group(7) else 'D'
-                value = parse_monetary_string(valor_str)
-                if value is None:
+
+            bb_pattern = re.compile(r'(\d{2}/\d{2}/\d{4})\s+(.+)')
+            match = bb_pattern.match(line)
+
+            if match:
+                try:
+                    date_obj = datetime.strptime(match.group(1), '%d/%m/%Y')
+                    remaining_line = match.group(2).strip()
+
+                    parts = remaining_line.split()
+                    value_str = "0"
+                    balance_str = "0"
+                    description = ""
+
+                    if len(parts) >= 2:
+                        if parts[-1] in ['C', 'D'] and len(parts) >=3:
+                            balance_str = parts[-2]
+                            value_candidate = ""
+                            for k in range(len(parts) - 3, -1, -1):
+                                if parse_monetary_string(parts[k]):
+                                    value_candidate = parts[k]
+                                    description = " ".join(parts[:k])
+                                    break
+                            value_str = value_candidate
+                        else:
+                            balance_str = parts[-1]
+                            value_str = parts[-2]
+                            description = " ".join(parts[:-2])
+
+                    j = i + 1
+                    while j < len(lines) and not re.match(r'\d{2}/\d{2}/\d{4}', lines[j]):
+                        description += " " + lines[j].strip()
+                        j += 1
+
+                    value = parse_monetary_string(value_str)
+                    if value is None:
+                        i += 1
+                        continue
+
+                    if "D" in parts[-1].upper() or (value < 0):
+                        value = -abs(value)
+                    else:
+                        value = abs(value)
+
+                    balance = parse_monetary_string(balance_str)
+
+                    transaction = Transaction(
+                        date=date_obj,
+                        description=description.strip(),
+                        value=value,
+                        balance=balance,
+                        source_bank='BB',
+                        confidence_score=0.95
+                    )
+                    transactions.append(transaction)
+                    i = j
+                except Exception as e:
+                    logger.warning(f"Erro ao processar linha BB: {line} - {e}")
+                    i += 1
                     continue
-                if valor_dc == 'D':
-                    value = -abs(value)
-                else:
-                    value = abs(value)
-                balance = None
-                if match.group(8):
-                    balance = parse_monetary_string(match.group(8))
-                    if balance:
-                        balance = abs(balance)
-                transaction = Transaction(
-                    date=date_obj,
-                    description=description,
-                    value=value,
-                    balance=balance,
-                    source_bank='BB',
-                    confidence_score=0.95
-                )
-                transactions.append(transaction)
-            except Exception as e:
-                continue
+            else:
+                i += 1
         return transactions
 
     def parse_bradesco(self, lines: List[str]) -> List[Transaction]:
@@ -316,281 +347,356 @@ class BankParser:
                     confidence_score=0.92
                 )
                 transactions.append(transaction)
-            except Exception:
-                continue
+            except Exception as e:
+                logger.warning(f"Erro ao processar linha CAIXA: {line_clean} - {e}")
         return transactions
 
-    def parse_itau(self, lines: List[str]) -> List[Transaction]:
+    def parse_xp(self, lines: List[str]) -> List[Transaction]:
         transactions = []
-        current_date = None
-        current_year = datetime.now().year
         for line in lines:
             line_clean = line.strip()
-            if len(line_clean) < 10:
+            if len(line_clean) < 15:
                 continue
-            if re.search(r'SALDO\s+(ANTERIOR|TOTAL|DISPONÍVEL)', line_clean, re.IGNORECASE):
-                continue
-            date_match = re.search(r'(\d{1,2})\s*/\s*(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)', line_clean, re.IGNORECASE)
-            if date_match:
-                try:
-                    day = int(date_match.group(1))
-                    month_abbr = date_match.group(2).lower()
-                    months = {
-                        'jan': 1, 'fev': 2, 'mar': 3, 'abr': 4, 'mai': 5, 'jun': 6,
-                        'jul': 7, 'ago': 8, 'set': 9, 'out': 10, 'nov': 11, 'dez': 12
-                    }
-                    month = months.get(month_abbr, 1)
-                    current_date = datetime(current_year, month, day)
-                except:
-                    continue
-            if not current_date:
-                continue
-            value_matches = re.findall(r'-?([\d.,]+)', line_clean)
-            if not value_matches:
-                continue
-            values = [parse_monetary_string(v) for v in value_matches]
-            values = [v for v in values if v and abs(v) > 0.01]
-            if not values:
-                continue
-            value = max(values, key=abs)
-            debit_keywords = ['BOLETO PAGO', 'PIX ENVIADO', 'PAGTO CDC', 'FIN VEIC', 'SISPAG TRIB']
-            credit_keywords = ['PIX TRANSF', 'TED.*RECEBIDA', 'MOV TIT COB DISP', 'INT RESGATE']
-            is_debit = any(kw in line_clean.upper() for kw in debit_keywords)
-            is_credit = any(re.search(kw, line_clean.upper()) for kw in credit_keywords)
-            if is_debit:
-                value = -abs(value)
-            elif is_credit:
-                value = abs(value)
-            elif line_clean.startswith('-'):
-                value = -abs(value)
-            description = re.sub(r'\d{1,2}\s*/\s*\w{3}|\d{2}/\d{2}/\d{4}', '', line_clean).strip()
-            description = re.sub(r'-?[\d.,]+', '', description).strip()
-            description = re.sub(r'\s+', ' ', description)[:100]
-            if len(description) < 3:
-                description = "Transação Itaú"
-            transaction = Transaction(
-                date=current_date,
-                description=description,
-                value=value,
-                balance=None,
-                source_bank='ITAU',
-                confidence_score=0.80
+            xp_pattern = re.compile(
+                r'(\d{2}/\d{2}/\d{4})\s+'
+                r'(.+?)\s+'
+                r'([\d.,]+|--)\s*'
+                r'([\d.,]+|--)\s*'
+                r'([\d.,]+)',
+                re.IGNORECASE
             )
-            transactions.append(transaction)
-        return transactions
-
-    def parse_generic(self, lines: List[str]) -> List[Transaction]:
-        transactions = []
-        for line in lines:
-            pattern = re.compile(r'(\d{2}/\d{2}/\d{4})\s+(.+?)\s+(-?[\d.,]+)\s+(-?[\d.,]+)?', re.IGNORECASE)
-            match = pattern.search(line)
+            match = xp_pattern.search(line_clean)
             if not match:
                 continue
             try:
                 date_obj = datetime.strptime(match.group(1), '%d/%m/%Y')
                 description = match.group(2).strip()
-                value = parse_monetary_string(match.group(3))
-                balance = parse_monetary_string(match.group(4)) if match.group(4) else None
+                debit_str = match.group(3).strip()
+                credit_str = match.group(4).strip()
+                saldo_str = match.group(5).strip()
+                value = None
+                if credit_str and credit_str != '--':
+                    value = parse_monetary_string(credit_str)
+                    if value:
+                        value = abs(value)
+                elif debit_str and debit_str != '--':
+                    value = parse_monetary_string(debit_str)
+                    if value:
+                        value = -abs(value)
+                if value is None:
+                    continue
+                saldo = parse_monetary_string(saldo_str)
+                transaction = Transaction(
+                    date=date_obj,
+                    description=description,
+                    value=value,
+                    balance=saldo,
+                    source_bank='XP',
+                    confidence_score=0.70
+                )
+                transactions.append(transaction)
+            except Exception as e:
+                logger.warning(f"Erro ao processar linha XP: {line_clean} - {e}")
+        return transactions
+
+    def parse_itau(self, lines: List[str]) -> List[Transaction]:
+        transactions = []
+        current_year = datetime.now().year
+        month_mapping = {
+            'jan': 1, 'fev': 2, 'mar': 3, 'abr': 4, 'mai': 5, 'jun': 6,
+            'jul': 7, 'ago': 8, 'set': 9, 'out': 10, 'nov': 11, 'dez': 12
+        }
+
+        for line in lines:
+            line_clean = line.strip()
+            if len(line_clean) < 15:
+                continue
+
+            # Itaú pattern: DD / MMM DESCRIPTION VALUE
+            itau_pattern = re.compile(
+                r'(\d{2})\s+/\s+(\w{3})\s+'  # Day and abbreviated month (e.g., 02 / dez)
+                r'(.+?)\s+'  # Description (non-greedy)
+                r'(-?[\d.,]+)'  # Value (can be negative)
+            )
+            match = itau_pattern.search(line_clean)
+
+            if match:
+                try:
+                    day = int(match.group(1))
+                    month_abbr = match.group(2).lower()
+                    month = month_mapping.get(month_abbr)
+                    if not month:
+                        raise ValueError(f"Mês abreviado desconhecido: {month_abbr}")
+
+                    date_obj = datetime(current_year, month, day)
+                    description = match.group(3).strip()
+                    value_str = match.group(4).strip()
+
+                    if 'SALDO' in description.upper():
+                        continue
+
+                    value = parse_monetary_string(value_str)
+                    if value is None:
+                        continue
+
+                    transaction = Transaction(
+                        date=date_obj,
+                        description=description,
+                        value=value,
+                        balance=None,  # Itaú statements often don't have a running balance per transaction
+                        source_bank='ITAU',
+                        confidence_score=0.80
+                    )
+                    transactions.append(transaction)
+                except Exception as e:
+                    logger.warning(f"Erro ao processar linha ITAU: {line_clean} - {e}")
+        return transactions
+
+    def parse_santander(self, lines: List[str]) -> List[Transaction]:
+        transactions = []
+        for line in lines:
+            line_clean = line.strip()
+            if len(line_clean) < 15:
+                continue
+            santander_pattern = re.compile(
+                r'(\d{2}/\d{2}/\d{4})\s+'
+                r'(.+?)\s+'
+                r'([\d.,]+)'
+            )
+            match = santander_pattern.search(line_clean)
+            if not match:
+                continue
+            try:
+                date_obj = datetime.strptime(match.group(1), '%d/%m/%Y')
+                description = match.group(2).strip()
+                value_str = match.group(3).strip()
+                if 'SALDO' in description.upper():
+                    continue
+                value = parse_monetary_string(value_str)
                 if value is None:
                     continue
                 transaction = Transaction(
                     date=date_obj,
                     description=description,
                     value=value,
-                    balance=balance,
-                    source_bank='GENERIC',
+                    balance=None, # Santander statements often don't have a running balance per transaction
+                    source_bank='SANTANDER',
                     confidence_score=0.70
                 )
                 transactions.append(transaction)
-            except Exception:
-                continue
+            except Exception as e:
+                logger.warning(f"Erro ao processar linha SANTANDER: {line_clean} - {e}")
         return transactions
 
-    def parse_xp(self, lines: List[str]) -> List[Transaction]:
-        st.warning("Parser para XP não implementado totalmente. Usando genérico.")
-        return self.parse_generic(lines)
-
-    def parse_santander(self, lines: List[str]) -> List[Transaction]:
-        st.warning("Parser para Santander não implementado totalmente. Usando genérico.")
-        return self.parse_generic(lines)
-
     def parse_sicoob(self, lines: List[str]) -> List[Transaction]:
-        st.warning("Parser para Sicoob não implementado totalmente. Usando genérico.")
-        return self.parse_generic(lines)
+        transactions = []
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if len(line) < 15 or "SALDO ANTERIOR" in line.upper() or "SALDO DO DIA" in line.upper() or "SALDO BLOQ.ANTERIOR" in line.upper():
+                i += 1
+                continue
+
+            # Sicoob pattern: DATE HISTÓRICO VALOR C/D
+            sicoob_pattern = re.compile(
+                r'(\d{2}/\d{2})\s+'  # Date (DD/MM)
+                r'(.+?)\s+'  # Description (non-greedy)
+                r'([\d.,]+)\s*([CD])'  # Value and C/D indicator
+            )
+            match = sicoob_pattern.search(line)
+
+            if match:
+                try:
+                    # Assuming the year is the current year, which might need adjustment
+                    date_str = f"{match.group(1)}/{datetime.now().year}"
+                    date_obj = datetime.strptime(date_str, '%d/%m/%Y')
+                    description_part = match.group(2).strip()
+                    value_str = match.group(3)
+                    value_dc = match.group(4).upper()
+
+                    # Handle multi-line descriptions
+                    full_description = description_part
+                    next_line_idx = i + 1
+                    while next_line_idx < len(lines) and not re.match(r'\d{2}/\d{2}', lines[next_line_idx]):
+                        if not re.search(r'SALDO (ANTERIOR|DO DIA|BLOQ.ANTERIOR)', lines[next_line_idx].upper()):
+                            full_description += " " + lines[next_line_idx].strip()
+                        next_line_idx += 1
+
+                    value = parse_monetary_string(value_str)
+                    if value is None:
+                        i = next_line_idx
+                        continue
+
+                    if value_dc == 'D':
+                        value = -abs(value)
+                    else:
+                        value = abs(value)
+
+                    transaction = Transaction(
+                        date=date_obj,
+                        description=full_description.strip(),
+                        value=value,
+                        balance=None,  # Sicoob statements often don't have a running balance per transaction
+                        source_bank='SICOOB',
+                        confidence_score=0.85
+                    )
+                    transactions.append(transaction)
+                    i = next_line_idx
+                except Exception as e:
+                    logger.warning(f"Erro ao processar linha SICOOB: {line} - {e}")
+                    i += 1
+                    continue
+            else:
+                i += 1
+        return transactions
 
     def parse_nubank(self, lines: List[str]) -> List[Transaction]:
-        st.warning("Parser para Nubank não implementado totalmente. Usando genérico.")
-        return self.parse_generic(lines)
+        transactions = []
+        current_year = datetime.now().year
+        month_mapping = {
+            'jan': 1, 'fev': 2, 'mar': 3, 'abr': 4, 'mai': 5, 'jun': 6,
+            'jul': 7, 'ago': 8, 'set': 9, 'out': 10, 'nov': 11, 'dez': 12
+        }
+
+        for line in lines:
+            line_clean = line.strip()
+            if len(line_clean) < 10:
+                continue
+
+            if "Nenhuma movimentação realizada." in line_clean:
+                return []
+
+            # Nubank format: DD MMM DESCRIPTION VALUE
+            # Example: 01 MAR PIX ENVIADO -100,00
+            nubank_pattern = re.compile(
+                r'(\d{2})\s+(\w{3})\s+'  # Day and abbreviated month (e.g., 01 MAR)
+                r'(.+?)\s+'  # Description (non-greedy)
+                r'(-?[\d.,]+)'  # Value (can be negative)
+            )
+            match = nubank_pattern.match(line_clean)
+
+            if match:
+                try:
+                    day = int(match.group(1))
+                    month_abbr = match.group(2).lower()
+                    month = month_mapping.get(month_abbr)
+                    if not month:
+                        raise ValueError(f"Mês abreviado desconhecido: {month_abbr}")
+
+                    date_obj = datetime(current_year, month, day)
+                    description = match.group(3).strip()
+                    value_str = match.group(4)
+
+                    value = parse_monetary_string(value_str)
+                    if value is None:
+                        continue
+
+                    transaction = Transaction(
+                        date=date_obj,
+                        description=description,
+                        value=value,
+                        balance=None,  # Nubank statements don't have a running balance
+                        source_bank='NUBANK',
+                        confidence_score=0.90
+                    )
+                    transactions.append(transaction)
+                except Exception as e:
+                    logger.warning(f"Erro ao processar linha NUBANK: {line} - {e}")
+        return transactions
+
+    def parse_generic(self, lines: List[str]) -> List[Transaction]:
+        transactions = []
+        # A very basic generic parser, tries to find lines with date, description and value
+        for line in lines:
+            line_clean = line.strip()
+            if len(line_clean) < 15:
+                continue
+            # Generic pattern: Date (DD/MM/YYYY), Description (anything), Value (monetary)
+            generic_pattern = re.compile(r'(\d{2}/\d{2}/\d{4})\s+(.+?)\s+([\d.,-]+)C?\s*$')
+            match = generic_pattern.search(line_clean)
+            if match:
+                try:
+                    date_obj = datetime.strptime(match.group(1), '%d/%m/%Y')
+                    description = match.group(2).strip()
+                    value_str = match.group(3).strip()
+                    value = parse_monetary_string(value_str)
+                    if value is None:
+                        continue
+                    transaction = Transaction(
+                        date=date_obj,
+                        description=description,
+                        value=value,
+                        balance=None,
+                        source_bank='GENERIC',
+                        confidence_score=0.70
+                    )
+                    transactions.append(transaction)
+                except Exception as e:
+                    logger.warning(f"Erro ao processar linha GENERIC: {line_clean} - {e}")
+        return transactions
 
 class BankStatementExtractor:
     def __init__(self):
         self.matcher = ProfessionalBankMatcher()
         self.parser = BankParser()
 
-    def extract_from_pdf_bytes(self, pdf_bytes: bytes, filename: str) -> pd.DataFrame:
+    def _get_parser(self, bank_format: str):
+        return {
+            'BB': self.parser.parse_bb,
+            'BRADESCO': self.parser.parse_bradesco,
+            'INTER': self.parser.parse_inter,
+            'CAIXA': self.parser.parse_caixa,
+            'XP': self.parser.parse_xp,
+            'ITAU': self.parser.parse_itau,
+            'SANTANDER': self.parser.parse_santander,
+            'SICOOB': self.parser.parse_sicoob,
+            'NUBANK': self.parser.parse_nubank,
+            'NUBANK_EMPTY': lambda lines: [],
+        }.get(bank_format, self.parser.parse_generic)
+
+    def extract_from_pdf_bytes(self, pdf_bytes: bytes, filename: str) -> List[Transaction]:
         try:
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                all_lines = []
+                text_lines = []
                 for page in pdf.pages:
-                    text = page.extract_text()
-                    if text:
-                        all_lines.extend(text.splitlines())
-            clean_lines = [line for line in all_lines if not self.matcher.is_noise_line(line)]
-            if not clean_lines:
-                return pd.DataFrame()
-            bank_format = self.matcher.detect_bank_format(clean_lines)
-            transactions = []
-            if bank_format == 'BB':
-                transactions = self.parser.parse_bb(clean_lines)
-            elif bank_format == 'BRADESCO':
-                transactions = self.parser.parse_bradesco(clean_lines)
-            elif bank_format == 'INTER':
-                transactions = self.parser.parse_inter(clean_lines)
-            elif bank_format == 'CAIXA':
-                transactions = self.parser.parse_caixa(clean_lines)
-            elif bank_format == 'ITAU':
-                transactions = self.parser.parse_itau(clean_lines)
-            elif bank_format == 'XP':
-                transactions = self.parser.parse_xp(clean_lines)
-            elif bank_format == 'SANTANDER':
-                transactions = self.parser.parse_santander(clean_lines)
-            elif bank_format == 'SICOOB':
-                transactions = self.parser.parse_sicoob(clean_lines)
-            elif bank_format == 'NUBANK':
-                transactions = self.parser.parse_nubank(clean_lines)
-            elif bank_format == 'GENERIC':
-                transactions = self.parser.parse_generic(clean_lines)
-            if not transactions:
-                return pd.DataFrame()
-            df = self._transactions_to_dataframe(transactions)
-            if not df.empty:
-                df['arquivo'] = filename
-                df['banco_detectado'] = bank_format
-            return df
-        except Exception as e:
-            logger.exception(f"Erro ao processar {filename}: {e}")
+                    text_lines.extend(page.extract_text().split('\n'))
+
+            if not text_lines:
+                logger.warning(f"Nenhum texto extraído de {filename}")
+                return []
+
+            bank_format = self.matcher.detect_bank_format(text_lines)
+            logger.info(f"Banco detectado para {filename}: {bank_format}")
+
+            parser_func = self._get_parser(bank_format)
+            transactions = parser_func(text_lines)
+
+            for t in transactions:
+                t.source_file = filename
+
+            logger.info(f"Processado {filename}: {len(transactions)} transações encontradas.")
+            
+            if transactions:
+                df = pd.DataFrame([t.__dict__ for t in transactions])
+                # Ensure date column is datetime and sort
+                df["date"] = pd.to_datetime(df["date"])
+                df = df.sort_values("date").reset_index(drop=True)
+                # Rename columns for clarity
+                df = df.rename(columns={
+                    "date": "data",
+                    "description": "descricao",
+                    "value": "valor",
+                    "balance": "saldo",
+                    "transaction_type": "tipo_transacao",
+                    "category": "categoria",
+                    "source_file": "arquivo_origem",
+                    "source_bank": "banco_detectado",
+                    "confidence_score": "confianca"
+                })
+                return df
             return pd.DataFrame()
 
-    def _transactions_to_dataframe(self, transactions: List[Transaction]) -> pd.DataFrame:
-        if not transactions:
-            return pd.DataFrame()
-        data = []
-        for t in transactions:
-            tipo = self._classify_transaction_type(t.description, t.value)
-            categoria = self._categorize_transaction(t.description)
-            data.append({
-                'data': t.date,
-                'descricao': t.description,
-                'valor': t.value,
-                'saldo': t.balance,
-                'tipo': tipo,
-                'categoria': categoria,
-                'confianca': t.confidence_score,
-                'banco_detectado': t.source_bank
-            })
-        df = pd.DataFrame(data)
-        df['data'] = pd.to_datetime(df['data'])
-        df = df.sort_values('data').reset_index(drop=True)
-        df['mes'] = df['data'].dt.month
-        df['ano'] = df['data'].dt.year
-        df['dia_semana'] = df['data'].dt.day_name()
-        df['valor_absoluto'] = df['valor'].abs()
-        df['mes_ano'] = df['data'].dt.to_period('M').astype(str)
-        df['eh_debito'] = df['valor'] < 0
-        df['eh_credito'] = df['valor'] > 0
-        # Validação simples de saldos
-        for i in range(1, len(df)):
-            if pd.notna(df['saldo'][i-1]) and pd.notna(df['valor'][i]) and pd.notna(df['saldo'][i]):
-                expected_balance = df['saldo'][i-1] + df['valor'][i]
-                if abs(expected_balance - df['saldo'][i]) > 0.01:
-                    logger.warning(f"Inconsistência de saldo na linha {i}: esperado {expected_balance}, encontrado {df['saldo'][i]}")
-        return df
-
-    def _classify_transaction_type(self, description: str, value: float) -> str:
-        desc = description.lower()
-        if value < 0:
-            if any(word in desc for word in ['pix', 'ted', 'doc', 'transferência']):
-                return 'TRANSFERÊNCIA_SAÍDA'
-            if any(word in desc for word in ['saque', 'atm', 'retirada']):
-                return 'SAQUE'
-            if any(word in desc for word in ['boleto', 'pagamento']):
-                return 'PAGAMENTO'
-            if any(word in desc for word in ['tarifa', 'taxa', 'juros']):
-                return 'TARIFA'
-            return 'DÉBITO'
-        else:
-            if any(word in desc for word in ['pix', 'ted', 'transferência']):
-                return 'TRANSFERÊNCIA_ENTRADA'
-            if any(word in desc for word in ['salário', 'remuneração']):
-                return 'SALÁRIO'
-            if any(word in desc for word in ['depósito']):
-                return 'DEPÓSITO'
-            return 'CRÉDITO'
-
-    def _categorize_transaction(self, description: str) -> str:
-        desc = description.lower()
-        if any(word in desc for word in ['mercado', 'supermercado', 'restaurante', 'lanche']):
-            return 'ALIMENTAÇÃO'
-        if any(word in desc for word in ['combustível', 'posto', 'uber', 'taxi']):
-            return 'TRANSPORTE'
-        if any(word in desc for word in ['energia', 'água', 'telefone', 'internet']):
-            return 'CASA'
-        if any(word in desc for word in ['farmácia', 'hospital', 'médico']):
-            return 'SAÚDE'
-        return 'OUTROS'
-
-def process_multiple_pdfs(uploaded_files):
-    extractor = BankStatementExtractor()
-    all_dfs = []
-    progress = st.progress(0)
-    status = st.empty()
-    for i, uploaded_file in enumerate(uploaded_files):
-        status.text(f'Processando {uploaded_file.name} ({i+1}/{len(uploaded_files)})')
-        try:
-            pdf_bytes = uploaded_file.read()
-            df = extractor.extract_from_pdf_bytes(pdf_bytes, uploaded_file.name)
-            if df.empty:
-                st.warning(f"⚠️ {uploaded_file.name}: nenhuma transação identificada")
-            else:
-                all_dfs.append(df)
-                banco = df['banco_detectado'].iloc[0] if not df.empty else 'N/A'
-                confianca = df['confianca'].mean()
-                st.success(f"✅ {uploaded_file.name}: {len(df)} transações | Banco: **{banco}** | Confiança: {confianca:.2f}")
         except Exception as e:
-            st.error(f"❌ Erro ao processar {uploaded_file.name}: {e}")
-        progress.progress((i + 1) / len(uploaded_files))
-    status.text("Processamento concluído")
-    if all_dfs:
-        combined = pd.concat(all_dfs, ignore_index=True)
-        combined = combined.sort_values('data').reset_index(drop=True)
-        return combined
-    return pd.DataFrame()
+            logger.error(f"Falha ao processar {filename}: {e}")
+            return []
 
-def main():
-    st.title("🏦 Extrator de Extratos Bancários - Versão Profissional")
-    st.markdown("Algoritmo robusto para processamento de múltiplos formatos bancários com alta precisão.")
-    uploaded_files = st.file_uploader(
-        "Escolha arquivos PDF de extratos bancários",
-        type="pdf",
-        accept_multiple_files=True,
-        help="Carregue extratos de BB, Bradesco, Inter, Caixa, Itaú, etc."
-    )
-    if uploaded_files:
-        if st.button("🚀 Processar Extratos", type="primary"):
-            with st.spinner("Processando com algoritmo profissional..."):
-                df = process_multiple_pdfs(uploaded_files)
-                if df.empty:
-                    st.error("❌ Nenhuma transação extraída. Verifique se os PDFs são extratos bancários válidos.")
-                else:
-                    st.success(f"✅ Extraídas {len(df)} transações no total.")
-                    st.dataframe(df)
-                    csv = df.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        label="📥 Baixar CSV",
-                        data=csv,
-                        file_name="extratos_processados.csv",
-                        mime="text/csv"
-                    )
-
-if __name__ == "__main__":
-    main()
